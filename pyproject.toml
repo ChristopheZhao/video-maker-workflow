@@ -1,0 +1,15 @@
+[project]
+name = "video-workflow-service"
+version = "0.1.0"
+description = "Workflow-first short video generation service"
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["video_workflow_service*"]
+
+[project.scripts]
+video-workflow-service = "video_workflow_service.cli:main"
