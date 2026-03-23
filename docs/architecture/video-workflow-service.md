@@ -425,3 +425,104 @@
 - Workflow rule:
   the preferred boundary is:
   `character_anchor(text cards) -> character_lookdev_hitl(on demand) -> scene_character_cast -> opening_still_generate(scene-filtered) -> scene_video_generate(first-frame mode)`
+
+## 21. Feedback-Driven Scene Revision
+- Positioning rule:
+  Feedback-driven revision is an assistive HITL editing path, not a replacement for direct prompt editing and not an auto-generate trigger.
+- Scene-01 rule:
+  `scene-01` may support two revision scopes:
+  `prompt_only`
+  `opening_still_and_prompt`
+  because its opening still is a dedicated opening-state asset.
+- Later-scene rule:
+  `scene-02..N` should default to `prompt_only` feedback revision.
+  They must not silently rewrite inherited continuity start-state truth through the prompt-revision path.
+- Safety rule:
+  If a later-scene feedback is actually changing continuity opening truth, the system should reject or redirect that request rather than mutating the prompt and leaving it inconsistent with the inherited start state.
+- Generate rule:
+  Revised prompts remain editable drafts.
+  `Generate Scene` continues to be the only approval/freeze point for downstream generation.
+
+## 22. Final Video Download UX
+- Delivery-action rule:
+  final preview/open and final download must be treated as separate UX intents.
+- Preview rule:
+  standard artifact URLs should remain inline/playable so the workflow page can embed and preview final video assets.
+- Download rule:
+  explicit download actions should use an attachment-style response so the browser downloads the file instead of replacing the workflow UI with a raw media page.
+- Safety rule:
+  this is a delivery-layer interaction fix only and must not change compose timing, workflow state, or artifact storage shape.
+
+## 23. Deferred Staged Scene Execution Idea
+- Positioning rule:
+  staged scene execution is a deferred internal execution strategy, not part of the current default workflow and not an added HITL layer.
+- Motivation rule:
+  it is intended for cases where the scene opening frame should establish environment first, while consistent character appearance is needed only after the opening moment.
+- Shape rule:
+  a possible future strategy is:
+  `Shot A (opening environment) -> extract A final frame -> optional bridge still using A tail frame plus approved character lookdev -> Shot B (character entrance) -> internal stitch`
+- UX rule:
+  if implemented later, users should still see one scene, one review surface, and one approval action.
+  `Shot A` and `Shot B` should remain internal execution details.
+- Continuity rule:
+  this approach is not a no-cut continuity guarantee.
+  if a bridge still is regenerated, it should be treated as a hidden internal cut that trades some continuity risk for better character stability.
+- Status rule:
+  record this as a future advanced mode only.
+  do not change the current first-frame-based scene generation path or introduce sub-shot workflow complexity yet.
+
+## 24. Composer Boundary Smoothing
+- Boundary rule:
+  the existing scene continuity design remains valid.
+  using the previous scene tail frame as the next scene first-frame hint should remain the default generation strategy.
+- Responsibility rule:
+  scene generation is responsible for making adjacent scenes connect semantically.
+  composer is responsible for making adjacent scene boundaries feel smooth in the final assembled delivery.
+- Compose rule:
+  final composition should not remain a plain hard concat when adjacent clips visibly jump at their boundaries.
+  conservative boundary trim and very short video/audio smoothing should be preferred before any heavier workflow redesign.
+- Safety rule:
+  this smoothing should live only in the final compose layer.
+  it must not change scene planning, scene review semantics, continuity inheritance, or the provider request shape for scene generation.
+
+## 25. Delivery Sidecar Subtitles
+- Positioning rule:
+  subtitle generation should be treated as a delivery-side enhancement path, not as part of the main scene-generation gate.
+- Product option rule:
+  subtitle work should be controlled by an explicit project-level option selected at task creation time.
+  that creation-time option should stay simple, such as `disabled | enabled`.
+  users should not be forced to choose between file delivery and burned delivery up front.
+- Workflow rule:
+  the preferred shape is:
+  `final_compose -> subtitle_align -> subtitle_publish`
+  with subtitle work running only when the project contains actual spoken dialogue.
+- Asset rule:
+  the first slice should publish sidecar subtitle assets such as `SRT` or `VTT`.
+  hard-burned subtitles should remain a later optional delivery mode, not the default.
+- Provider rule:
+  because this workflow already stores approved dialogue text, text-based subtitle timing is the preferred primary alignment strategy.
+  speech-recognition-based fallback should remain available when generated speech diverges from the planned text or timing alignment fails.
+- Safety rule:
+  subtitle generation failure must not block final video delivery.
+  the final video remains the primary artifact, and subtitles are an additive best-effort asset.
+- Current implementation rule:
+  project creation now carries an explicit subtitle-mode switch.
+  current implementation still stores the sidecar-first slice internally, but the intended product semantics are a simpler `disabled | enabled` subtitle toggle.
+  after `final_compose`, the service may queue a separate subtitle job without changing the delivered status of the final video.
+- Primary execution rule:
+  the current primary path extracts audio from `final.mp4`, concatenates approved scene dialogue text in scene order, and sends that audio-plus-text pair to a dedicated Volcengine speech subtitle client for `自动字幕打轴`.
+  subtitle service wiring stays separate from the LLM provider layer.
+- Fallback execution rule:
+  the current fallback uses `录音文件极速版` against the extracted final-delivery audio.
+  because this path can upload audio data directly, the service does not require a publicly reachable artifact base URL for fallback execution.
+  its purpose is to recover real `utterances[start_time,end_time,text]` from delivered speech when ATA alignment is unavailable or unreliable.
+- Publishing rule:
+  successful subtitle alignment currently publishes `final.srt` and `final.vtt` beside the delivered MP4 and reuses the existing artifact route for download.
+  the current user-facing delivery shape is:
+  - in-player subtitle loading
+  - a one-click delivery package containing the original MP4 plus subtitle files
+  - an on-demand burned-subtitle export that produces a separate `final_burned.mp4`
+  without replacing the original final video.
+  burned-subtitle export should not depend on host-installed CJK fonts; it should use a bundled repo font and explicit FFmpeg subtitle font settings so Chinese text remains stable across environments.
+- Deferred work rule:
+  the remaining subtitle hardening work is now concentrated in real-service verification and optional refinement of fallback heuristics.

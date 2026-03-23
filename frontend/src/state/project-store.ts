@@ -11,6 +11,7 @@ export interface ProjectFormState {
   provider: string;
   sceneCount: number;
   workflowMode: string;
+  subtitleMode: string;
   scene1FirstFrameSource: string;
   scene1FirstFrameImage: string | null;
   scene1FirstFramePrompt: string;
@@ -27,7 +28,10 @@ export interface AppState {
   projectBootstrapStage: "idle" | "creating_project" | "global_planning" | "scene_planning";
   isStartingWorkflow: boolean;
   isComposing: boolean;
-  activeSceneAction: { sceneId: string; action: "generate" | "approve" | "save_first_frame" | "save_prompt" } | null;
+  activeSceneAction: {
+    sceneId: string;
+    action: "generate" | "approve" | "save_first_frame" | "save_prompt" | "revise_prompt";
+  } | null;
   activeCharacterAction: {
     characterId: string;
     action: "generate_reference" | "approve_reference" | "upload_reference";
@@ -52,10 +56,14 @@ type Action =
       stage: "creating_project" | "global_planning" | "scene_planning";
       message: string;
     }
-  | { type: "project/create-success"; project: ProjectRecord }
+  | { type: "project/create-success"; project: ProjectRecord; message: string }
   | { type: "workflow/start-start" }
-  | { type: "workflow/start-success"; project: ProjectRecord }
-  | { type: "scene/action-start"; sceneId: string; action: "generate" | "approve" | "save_first_frame" | "save_prompt" }
+  | { type: "workflow/start-success"; project: ProjectRecord; message: string }
+  | {
+      type: "scene/action-start";
+      sceneId: string;
+      action: "generate" | "approve" | "save_first_frame" | "save_prompt" | "revise_prompt";
+    }
   | { type: "scene/action-success"; project: ProjectRecord; message: string }
   | {
       type: "character/action-start";
@@ -77,6 +85,7 @@ const DEFAULT_FORM: ProjectFormState = {
   provider: "doubao",
   sceneCount: 3,
   workflowMode: "hitl",
+  subtitleMode: "disabled",
   scene1FirstFrameSource: "auto_generate",
   scene1FirstFrameImage: null,
   scene1FirstFramePrompt: "",
@@ -179,7 +188,7 @@ export function reducer(state: AppState, action: Action): AppState {
         activeSceneAction: null,
         activeCharacterAction: null,
         errorMessage: null,
-        notice: `Project ${action.project.project_id} created.`
+        notice: action.message
       };
     case "workflow/start-start":
       return {
@@ -205,7 +214,7 @@ export function reducer(state: AppState, action: Action): AppState {
         activeSceneAction: null,
         activeCharacterAction: null,
         errorMessage: null,
-        notice: `Workflow queued for ${action.project.project_id}.`
+        notice: action.message
       };
     case "scene/action-start":
       return {
@@ -320,6 +329,17 @@ export function shouldPollProject(
   }
   if (!project) {
     return false;
+  }
+  const subtitleStatus = project.subtitle?.status;
+  const subtitleBurnStatus = project.subtitle?.burn_status;
+  if (
+    subtitleStatus === "queued" ||
+    subtitleStatus === "running" ||
+    subtitleStatus === "pending" ||
+    subtitleBurnStatus === "queued" ||
+    subtitleBurnStatus === "running"
+  ) {
+    return true;
   }
   return project.scenes.some((scene) => {
     const jobStatus = scene.video_job?.status;

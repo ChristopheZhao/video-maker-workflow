@@ -65,6 +65,13 @@ a {
   margin-bottom: 28px;
 }
 
+.hero-copy-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 .hero-copy h1 {
   margin: 0 0 12px;
   max-width: 9ch;
@@ -76,6 +83,32 @@ a {
 .hero-copy p:last-child {
   max-width: 48ch;
   color: var(--ink-muted);
+}
+
+.locale-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(16, 33, 58, 0.1);
+  box-shadow: 0 12px 24px rgba(16, 33, 58, 0.08);
+}
+
+.locale-button {
+  min-width: 54px;
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-muted);
+  font-weight: 600;
+}
+
+.locale-button-active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #fff;
 }
 
 .hero-visual {
@@ -791,10 +824,17 @@ a {
 }
 
 .delivery-actions {
-  grid-auto-flow: column;
-  justify-content: start;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
   align-items: center;
   margin-top: 18px;
+}
+
+.delivery-status-stack {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
 }
 
 .status-pill {
@@ -869,6 +909,11 @@ a {
   .next-action-rail {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .hero-copy-top {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 

@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { CharacterCardRecord } from "../api/client";
+import { formatEnumLabel } from "../i18n/catalog";
+import { useI18n } from "../i18n/provider";
 
 interface CharacterLookdevPanelProps {
   characterCards: CharacterCardRecord[];
@@ -12,10 +14,6 @@ interface CharacterLookdevPanelProps {
   onUploadReference: (characterId: string, referenceImage: string) => void;
 }
 
-function formatStatus(value: string | undefined) {
-  return (value || "pending").replace(/_/g, " ");
-}
-
 export function CharacterLookdevPanel({
   characterCards,
   activeAction,
@@ -23,7 +21,9 @@ export function CharacterLookdevPanel({
   onApproveReference,
   onUploadReference
 }: CharacterLookdevPanelProps) {
+  const { messages } = useI18n();
   const [pendingUploads, setPendingUploads] = useState<Record<string, { image: string; fileName: string }>>({});
+  const formatStatus = (value: string | undefined) => formatEnumLabel(value, messages.enums);
 
   if (!characterCards.length) {
     return null;
@@ -59,16 +59,13 @@ export function CharacterLookdevPanel({
     <section className="panel">
       <div className="panel-header">
         <div>
-          <p className="eyebrow">Character References</p>
-          <h2>Visual Character Guides</h2>
+          <p className="eyebrow">{messages.characterLookdev.eyebrow}</p>
+          <h2>{messages.characterLookdev.title}</h2>
         </div>
         <span className="panel-badge">{characterCards.length}</span>
       </div>
 
-      <p className="empty-copy">
-        Use these optional references to keep important characters visually consistent across planning and generated
-        opening stills.
-      </p>
+      <p className="empty-copy">{messages.characterLookdev.description}</p>
 
       <div className="character-lookdev-grid">
         {characterCards.map((card) => {
@@ -86,31 +83,39 @@ export function CharacterLookdevPanel({
               <div className="scene-card-header">
                 <div>
                   <span className="scene-index">{card.display_name}</span>
-                  <h3>{card.story_role || "Character profile"}</h3>
+                  <h3>{card.story_role || messages.characterLookdev.profileFallback}</h3>
                 </div>
                 <span className={`status-pill status-${card.approval_status || "pending"}`}>
                   {formatStatus(card.approval_status)}
                 </span>
               </div>
 
-              <p className="scene-copy">{card.visual_description || card.reference_prompt || "No visual summary yet."}</p>
+              <p className="scene-copy">
+                {card.visual_description || card.reference_prompt || messages.characterLookdev.noSummary}
+              </p>
 
               {previewUrl ? (
-                <img className="scene-frame scene-first-frame-preview" src={previewUrl} alt={`${card.display_name} lookdev`} />
+                <img
+                  className="scene-frame scene-first-frame-preview"
+                  src={previewUrl}
+                  alt={messages.characterLookdev.lookdevAlt(card.display_name)}
+                />
               ) : (
-                <div className="scene-frame scene-frame-empty">No reference image yet. Generate one or upload a replacement.</div>
+                <div className="scene-frame scene-frame-empty">{messages.characterLookdev.noReferenceImage}</div>
               )}
 
               <div className="scene-first-frame-summary">
                 <span>
                   {previewUrl
-                    ? `Current image: ${card.source || "generated"}`
-                    : "This character currently uses text only. Generate or upload an image if you want a visual guide."}
+                    ? messages.characterLookdev.currentImage(
+                        formatEnumLabel(card.source || "generated", messages.enums)
+                      )
+                    : messages.characterLookdev.textOnlyGuide}
                 </span>
               </div>
 
               <label className="field">
-                <span>Replace Image</span>
+                <span>{messages.characterLookdev.replaceImageLabel}</span>
                 <input
                   type="file"
                   accept="image/png,image/jpeg,image/webp"
@@ -121,7 +126,7 @@ export function CharacterLookdevPanel({
 
               {uploadDraft?.fileName ? (
                 <div className="scene-first-frame-summary">
-                  <span>Selected file: {uploadDraft.fileName}</span>
+                  <span>{messages.projectForm.selectedFile(uploadDraft.fileName)}</span>
                 </div>
               ) : null}
 
@@ -131,21 +136,21 @@ export function CharacterLookdevPanel({
                   onClick={() => onGenerateReference(card.character_id)}
                   disabled={Boolean(activeAction)}
                 >
-                  {isGenerating ? "Generating..." : "Generate Image"}
+                  {isGenerating ? messages.characterLookdev.generatingImage : messages.characterLookdev.generateImage}
                 </button>
                 <button
                   className="secondary-button"
                   onClick={() => uploadDraft && onUploadReference(card.character_id, uploadDraft.image)}
                   disabled={!uploadDraft || Boolean(activeAction)}
                 >
-                  {isUploading ? "Uploading..." : "Replace Image"}
+                  {isUploading ? messages.characterLookdev.uploadingImage : messages.characterLookdev.replaceImage}
                 </button>
                 <button
                   className="primary-button"
                   onClick={() => onApproveReference(card.character_id)}
                   disabled={Boolean(activeAction) || card.approval_status === "approved"}
                 >
-                  {isApproving ? "Approving..." : "Approve Reference"}
+                  {isApproving ? messages.characterLookdev.approvingReference : messages.characterLookdev.approveReference}
                 </button>
               </div>
             </article>

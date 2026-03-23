@@ -12,6 +12,7 @@ _STEP_MODEL_ATTRS = {
     "dialogue_allocate": "llm_dialogue_allocate_model",
     "first_frame_analyze": "llm_first_frame_analyze_model",
     "scene_prompt_render": "llm_scene_prompt_render_model",
+    "scene_prompt_revise": "llm_scene_prompt_revise_model",
     "dialogue_split": "llm_dialogue_split_model",
 }
 

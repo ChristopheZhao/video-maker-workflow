@@ -54,6 +54,7 @@ class ServiceSettings:
     frontend_dir: Path
     frontend_dist_dir: Path
     ffmpeg_bin: str
+    ffprobe_bin: str
     host: str
     port: int
     log_level: str
@@ -63,6 +64,11 @@ class ServiceSettings:
     default_aspect_ratio: str
     default_scene_count: int
     workflow_max_workers: int
+    composer_boundary_trim_seconds: float
+    composer_video_crossfade_seconds: float
+    composer_audio_crossfade_seconds: float
+    subtitle_service_name: str
+    subtitle_request_timeout_seconds: int
     doubao_api_key: str
     doubao_base_url: str
     doubao_create_path: str
@@ -84,6 +90,7 @@ class ServiceSettings:
     llm_dialogue_allocate_provider: str | None
     llm_first_frame_analyze_provider: str | None
     llm_scene_prompt_render_provider: str | None
+    llm_scene_prompt_revise_provider: str | None
     llm_dialogue_split_provider: str | None
     llm_character_anchor_model: str | None
     llm_scene_character_cast_model: str | None
@@ -93,6 +100,7 @@ class ServiceSettings:
     llm_dialogue_allocate_model: str | None
     llm_first_frame_analyze_model: str | None
     llm_scene_prompt_render_model: str | None
+    llm_scene_prompt_revise_model: str | None
     llm_dialogue_split_model: str | None
     llm_timeout_seconds: int
     doubao_llm_api_key: str
@@ -101,6 +109,15 @@ class ServiceSettings:
     deepseek_api_key: str
     deepseek_base_url: str
     deepseek_chat_path: str
+    volcengine_speech_app_id: str
+    volcengine_speech_access_token: str
+    volcengine_speech_base_url: str
+    volcengine_speech_ata_submit_path: str
+    volcengine_speech_ata_query_path: str
+    volcengine_speech_ata_punctuation_mode: int
+    volcengine_speech_asr_submit_path: str
+    volcengine_speech_asr_resource_id: str
+    volcengine_speech_asr_model_name: str
 
     @classmethod
     def for_root(
@@ -127,6 +144,7 @@ class ServiceSettings:
             frontend_dir=frontend_dir,
             frontend_dist_dir=frontend_dist_dir,
             ffmpeg_bin=env.get("FFMPEG_BIN", "ffmpeg"),
+            ffprobe_bin=env.get("FFPROBE_BIN", "ffprobe"),
             host=env.get("VIDEO_WORKFLOW_HOST", "127.0.0.1"),
             port=int(env.get("VIDEO_WORKFLOW_PORT", "8787")),
             log_level=env.get("VIDEO_WORKFLOW_LOG_LEVEL", "INFO").upper(),
@@ -136,6 +154,22 @@ class ServiceSettings:
             default_aspect_ratio=env.get("VIDEO_WORKFLOW_ASPECT_RATIO", "16:9"),
             default_scene_count=int(env.get("VIDEO_WORKFLOW_SCENE_COUNT", "3")),
             workflow_max_workers=int(env.get("VIDEO_WORKFLOW_MAX_WORKERS", "2")),
+            composer_boundary_trim_seconds=float(
+                env.get("VIDEO_WORKFLOW_COMPOSER_BOUNDARY_TRIM_SECONDS", "0.08")
+            ),
+            composer_video_crossfade_seconds=float(
+                env.get("VIDEO_WORKFLOW_COMPOSER_VIDEO_CROSSFADE_SECONDS", "0.18")
+            ),
+            composer_audio_crossfade_seconds=float(
+                env.get("VIDEO_WORKFLOW_COMPOSER_AUDIO_CROSSFADE_SECONDS", "0.15")
+            ),
+            subtitle_service_name=env.get(
+                "VIDEO_WORKFLOW_SUBTITLE_SERVICE",
+                "volcengine_speech",
+            ).strip().lower(),
+            subtitle_request_timeout_seconds=int(
+                env.get("VIDEO_WORKFLOW_SUBTITLE_REQUEST_TIMEOUT_SECONDS", "300")
+            ),
             doubao_api_key=doubao_api_key,
             doubao_base_url=doubao_base_url,
             doubao_create_path=env.get(
@@ -204,6 +238,9 @@ class ServiceSettings:
             llm_scene_prompt_render_provider=(
                 env.get("VIDEO_WORKFLOW_LLM_SCENE_PROMPT_RENDER_PROVIDER", "").strip().lower() or None
             ),
+            llm_scene_prompt_revise_provider=(
+                env.get("VIDEO_WORKFLOW_LLM_SCENE_PROMPT_REVISE_PROVIDER", "").strip().lower() or None
+            ),
             llm_dialogue_split_provider=(
                 env.get("VIDEO_WORKFLOW_LLM_DIALOGUE_SPLIT_PROVIDER", "").strip().lower() or None
             ),
@@ -231,6 +268,9 @@ class ServiceSettings:
             llm_scene_prompt_render_model=(
                 env.get("VIDEO_WORKFLOW_LLM_SCENE_PROMPT_RENDER_MODEL", "").strip() or None
             ),
+            llm_scene_prompt_revise_model=(
+                env.get("VIDEO_WORKFLOW_LLM_SCENE_PROMPT_REVISE_MODEL", "").strip() or None
+            ),
             llm_dialogue_split_model=(
                 env.get("VIDEO_WORKFLOW_LLM_DIALOGUE_SPLIT_MODEL", "").strip() or None
             ),
@@ -244,6 +284,35 @@ class ServiceSettings:
             deepseek_api_key=env.get("DEEPSEEK_API_KEY", "").strip(),
             deepseek_base_url=env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
             deepseek_chat_path=env.get("DEEPSEEK_CHAT_PATH", "/chat/completions").strip(),
+            volcengine_speech_app_id=env.get("VOLCENGINE_SPEECH_APP_ID", "").strip(),
+            volcengine_speech_access_token=env.get("VOLCENGINE_SPEECH_ACCESS_TOKEN", "").strip(),
+            volcengine_speech_base_url=env.get(
+                "VOLCENGINE_SPEECH_BASE_URL",
+                "https://openspeech.bytedance.com",
+            ).strip(),
+            volcengine_speech_ata_submit_path=env.get(
+                "VOLCENGINE_SPEECH_ATA_SUBMIT_PATH",
+                "/api/v1/vc/ata/submit",
+            ).strip(),
+            volcengine_speech_ata_query_path=env.get(
+                "VOLCENGINE_SPEECH_ATA_QUERY_PATH",
+                "/api/v1/vc/ata/query",
+            ).strip(),
+            volcengine_speech_ata_punctuation_mode=int(
+                env.get("VOLCENGINE_SPEECH_ATA_PUNCTUATION_MODE", "3")
+            ),
+            volcengine_speech_asr_submit_path=env.get(
+                "VOLCENGINE_SPEECH_ASR_SUBMIT_PATH",
+                "/api/v3/auc/bigmodel/recognize/flash",
+            ).strip(),
+            volcengine_speech_asr_resource_id=env.get(
+                "VOLCENGINE_SPEECH_ASR_RESOURCE_ID",
+                "volc.bigasr.auc_turbo",
+            ).strip(),
+            volcengine_speech_asr_model_name=env.get(
+                "VOLCENGINE_SPEECH_ASR_MODEL_NAME",
+                "bigmodel",
+            ).strip(),
         )
 
 

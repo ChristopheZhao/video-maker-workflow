@@ -54,11 +54,24 @@ English README:
 
 - 使用 `uv` 管理 Python 环境
 - 已安装 `Node.js` 和 `npm`
-- 系统里可直接调用 `ffmpeg`
+- 系统里可直接调用 `ffmpeg` 和 `ffprobe`
+- `ffmpeg` 需要带有字幕烧录能力，也就是支持 `subtitles` / `libass` filter
 - 你自己的 Doubao / Ark 账号，并开通这些模型能力：
   - 视频生成模型
   - `doubao-seed-2-0-lite-260215`，用于规划类 LLM 节点
   - `doubao-seedream-5-0-lite-260128`，用于首帧自动生图
+
+如果你要启用字幕交付，还需要准备火山语音服务应用，并开通：
+
+- `VOLCENGINE_SPEECH_APP_ID`
+- `VOLCENGINE_SPEECH_ACCESS_TOKEN`
+- 自动字幕打轴能力
+- `volc.bigasr.auc_turbo`，用于 ASR fallback
+
+说明：
+
+- 字幕是可选旁路能力；如果没有配置语音字幕凭据，主视频工作流仍然可以正常运行，只是不会产出字幕交付物。
+- 导出带字幕视频时，**不需要**你在宿主机额外安装中文字体。仓库已经内置一套 CJK 字体，并在烧录阶段显式使用。
 
 ## 环境配置
 
@@ -119,12 +132,27 @@ VIDEO_WORKFLOW_MAX_WORKERS=2
 VIDEO_WORKFLOW_PORT=8787
 ```
 
+如果要启用字幕交付，额外补这些配置：
+
+```bash
+VIDEO_WORKFLOW_SUBTITLE_SERVICE=volcengine_speech
+VOLCENGINE_SPEECH_APP_ID=
+VOLCENGINE_SPEECH_ACCESS_TOKEN=
+VOLCENGINE_SPEECH_BASE_URL=https://openspeech.bytedance.com
+VOLCENGINE_SPEECH_ATA_SUBMIT_PATH=/api/v1/vc/ata/submit
+VOLCENGINE_SPEECH_ATA_QUERY_PATH=/api/v1/vc/ata/query
+VOLCENGINE_SPEECH_ASR_SUBMIT_PATH=/api/v3/auc/bigmodel/recognize/flash
+VOLCENGINE_SPEECH_ASR_RESOURCE_ID=volc.bigasr.auc_turbo
+VOLCENGINE_SPEECH_ASR_MODEL_NAME=bigmodel
+```
+
 说明：
 
 - Shell 环境变量优先级高于 `.env`
 - `.env.local` 会覆盖 `.env`
 - 改完 `.env` 后，需要重启后端
 - 如果没有显式设置 `VIDEO_WORKFLOW_LLM_PROVIDER=doubao`，本地某些场景下可能会回退到内部 `mock` LLM
+- 字幕 fallback 现在不再依赖 `VIDEO_WORKFLOW_PUBLIC_BASE_URL`
 
 ## 快速启动
 

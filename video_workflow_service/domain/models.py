@@ -99,6 +99,64 @@ class FinalVideoJob:
 
 
 @dataclass(slots=True)
+class SubtitleJob:
+    job_id: str
+    status: str = "pending"
+    provider: str = ""
+    mode: str = "sidecar"
+    alignment_strategy: str = "text_alignment"
+    provider_task_id: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    failed_at: str | None = None
+    error_message: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SubtitleJob":
+        return cls(
+            job_id=str(payload.get("job_id", "")),
+            status=str(payload.get("status", "pending")),
+            provider=str(payload.get("provider", "")),
+            mode=str(payload.get("mode", "sidecar")),
+            alignment_strategy=str(payload.get("alignment_strategy", "text_alignment")),
+            provider_task_id=payload.get("provider_task_id"),
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+            failed_at=payload.get("failed_at"),
+            error_message=payload.get("error_message"),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
+class SubtitleBurnJob:
+    job_id: str
+    status: str = "pending"
+    provider: str = "ffmpeg"
+    output_rel_path: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    failed_at: str | None = None
+    error_message: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SubtitleBurnJob":
+        return cls(
+            job_id=str(payload.get("job_id", "")),
+            status=str(payload.get("status", "pending")),
+            provider=str(payload.get("provider", "ffmpeg")),
+            output_rel_path=payload.get("output_rel_path"),
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+            failed_at=payload.get("failed_at"),
+            error_message=payload.get("error_message"),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
 class WorkflowRunJob:
     job_id: str
     status: str = "pending"
@@ -259,6 +317,7 @@ class Project:
     aspect_ratio: str
     provider: str
     workflow_mode: str = "auto"
+    subtitle_mode: str = "disabled"
     scene_count: int | None = None
     scene1_first_frame_source: str = "auto_generate"
     scene1_first_frame_image: str | None = None
@@ -277,7 +336,12 @@ class Project:
     optimized_prompt: str | None = None
     scenes: list[Scene] = field(default_factory=list)
     final_video_rel_path: str | None = None
+    subtitle_srt_rel_path: str | None = None
+    subtitle_vtt_rel_path: str | None = None
+    subtitle_burned_video_rel_path: str | None = None
     final_video_job: FinalVideoJob | None = None
+    subtitle_job: SubtitleJob | None = None
+    subtitle_burn_job: SubtitleBurnJob | None = None
     workflow_run_job: WorkflowRunJob | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -310,6 +374,8 @@ class Project:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Project":
         final_video_job_payload = payload.get("final_video_job")
+        subtitle_job_payload = payload.get("subtitle_job")
+        subtitle_burn_job_payload = payload.get("subtitle_burn_job")
         workflow_run_job_payload = payload.get("workflow_run_job")
         return cls(
             project_id=str(payload.get("project_id", "")),
@@ -319,6 +385,7 @@ class Project:
             aspect_ratio=str(payload.get("aspect_ratio", "16:9")),
             provider=str(payload.get("provider", "mock")),
             workflow_mode=str(payload.get("workflow_mode", "auto")),
+            subtitle_mode=str(payload.get("subtitle_mode", "disabled")),
             scene_count=int(payload["scene_count"]) if payload.get("scene_count") is not None else None,
             scene1_first_frame_source=str(payload.get("scene1_first_frame_source", "auto_generate")),
             scene1_first_frame_image=payload.get("scene1_first_frame_image"),
@@ -337,8 +404,17 @@ class Project:
             optimized_prompt=payload.get("optimized_prompt"),
             scenes=[Scene.from_dict(item) for item in payload.get("scenes", [])],
             final_video_rel_path=payload.get("final_video_rel_path"),
+            subtitle_srt_rel_path=payload.get("subtitle_srt_rel_path"),
+            subtitle_vtt_rel_path=payload.get("subtitle_vtt_rel_path"),
+            subtitle_burned_video_rel_path=payload.get("subtitle_burned_video_rel_path"),
             final_video_job=FinalVideoJob.from_dict(final_video_job_payload)
             if isinstance(final_video_job_payload, dict)
+            else None,
+            subtitle_job=SubtitleJob.from_dict(subtitle_job_payload)
+            if isinstance(subtitle_job_payload, dict)
+            else None,
+            subtitle_burn_job=SubtitleBurnJob.from_dict(subtitle_burn_job_payload)
+            if isinstance(subtitle_burn_job_payload, dict)
             else None,
             workflow_run_job=WorkflowRunJob.from_dict(workflow_run_job_payload)
             if isinstance(workflow_run_job_payload, dict)

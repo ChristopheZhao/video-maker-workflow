@@ -387,6 +387,62 @@ class ScenePromptUpdateInput:
 
 
 @dataclass(slots=True)
+class ScenePromptRevisionRequest:
+    feedback: str
+    scope: str = "prompt_only"
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ScenePromptRevisionRequest":
+        return cls(
+            feedback=str(payload.get("feedback", "")).strip(),
+            scope=str(payload.get("scope", "prompt_only")).strip().lower() or "prompt_only",
+        )
+
+    def validate(self) -> None:
+        if not self.feedback:
+            raise ValueError("Scene feedback must not be empty")
+        if self.scope not in {"prompt_only", "opening_still_and_prompt"}:
+            raise ValueError("scope must be prompt_only or opening_still_and_prompt")
+
+
+@dataclass(slots=True)
+class ScenePromptRevisionInput:
+    scene_id: str
+    scene_index: int
+    scene_count: int
+    raw_prompt: str
+    current_prompt: str
+    current_rendered_prompt: str = ""
+    title: str = ""
+    narrative: str = ""
+    visual_goal: str = ""
+    spoken_text: str = ""
+    speech_mode: str = "none"
+    delivery_notes: str = ""
+    continuity_notes: str = ""
+    first_frame_source: str = "auto_generate"
+    first_frame_prompt: str = ""
+    first_frame_analysis: dict[str, Any] = field(default_factory=dict)
+    input_language: str = ""
+    dialogue_language: str = ""
+    audio_language: str = ""
+    feedback: str = ""
+    requested_scope: str = "prompt_only"
+    project_guidance_context: dict[str, Any] = field(default_factory=dict)
+    scene_guidance_context: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ScenePromptRevisionOutput:
+    outcome: str
+    revised_prompt: str = ""
+    revised_first_frame_prompt: str = ""
+    change_summary: str = ""
+    rejection_reason: str = ""
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class SceneGenerationInput:
     project_id: str
     provider: str

@@ -12,6 +12,7 @@ _STEP_PROVIDER_ATTRS = {
     "dialogue_allocate": "llm_dialogue_allocate_provider",
     "first_frame_analyze": "llm_first_frame_analyze_provider",
     "scene_prompt_render": "llm_scene_prompt_render_provider",
+    "scene_prompt_revise": "llm_scene_prompt_revise_provider",
     "dialogue_split": "llm_dialogue_split_provider",
 }
 

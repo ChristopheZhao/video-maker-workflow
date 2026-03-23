@@ -38,6 +38,8 @@ class MockLLMProvider(LLMProvider):
             payload = self._build_first_frame_analyze_payload(request.input_payload)
         elif request.step_name == "scene_prompt_render":
             payload = self._build_scene_prompt_render_payload(request.input_payload)
+        elif request.step_name == "scene_prompt_revise":
+            payload = self._build_scene_prompt_revise_payload(request.input_payload)
         else:
             raise ValueError(f"Unsupported mock llm step: {request.step_name}")
         return LLMResponse(
@@ -314,6 +316,54 @@ class MockLLMProvider(LLMProvider):
             "analysis_notes": "Treat the provided still as the opening truth for continuation."
         }
 
+    def _build_scene_prompt_revise_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        feedback = str(payload.get("feedback", "")).strip()
+        requested_scope = str(payload.get("requested_scope", "prompt_only")).strip().lower()
+        current_prompt = str(payload.get("current_prompt", "")).strip()
+        first_frame_prompt = str(payload.get("first_frame_prompt", "")).strip()
+        first_frame_source = str(payload.get("first_frame_source", "")).strip().lower()
+        input_language = str(payload.get("input_language", "")).strip().lower()
+        if requested_scope == "prompt_only" and first_frame_source == "continuity" and _feedback_targets_start_state(feedback):
+            rejection_reason = (
+                "The feedback changes the inherited scene start state and cannot be applied through prompt-only revision."
+            )
+            if input_language == "zh":
+                rejection_reason = "该反馈会改变继承来的场景起始状态，不能仅通过提示词改写完成。"
+            return {
+                "outcome": "requires_start_state_edit",
+                "revised_prompt": "",
+                "revised_first_frame_prompt": "",
+                "change_summary": "",
+                "rejection_reason": rejection_reason,
+            }
+
+        revised_prompt = current_prompt
+        if feedback:
+            revised_prompt = (
+                f"{current_prompt} 根据用户反馈调整：{feedback}"
+                if input_language == "zh"
+                else f"{current_prompt} Revised to reflect user feedback: {feedback}"
+            ).strip()
+        revised_first_frame_prompt = ""
+        if requested_scope == "opening_still_and_prompt":
+            revised_first_frame_prompt = (
+                f"{first_frame_prompt} 开场修正：{feedback}"
+                if input_language == "zh"
+                else f"{first_frame_prompt} Opening-state revision: {feedback}"
+            ).strip()
+        change_summary = (
+            f"已根据反馈调整场景提示词：{feedback}"
+            if input_language == "zh"
+            else f"Adjusted the scene prompt from user feedback: {feedback}"
+        )
+        return {
+            "outcome": "revised",
+            "revised_prompt": revised_prompt,
+            "revised_first_frame_prompt": revised_first_frame_prompt,
+            "change_summary": change_summary,
+            "rejection_reason": "",
+        }
+
 
 def _extract_dialogue_lines(prompt: str) -> list[str]:
     candidates = re.findall(r"[\"“”]([^\"“”]{2,})[\"“”]", prompt)
@@ -352,6 +402,24 @@ def _allocate_dialogue_segments(dialogue_lines: list[str], scene_count: int) -> 
         if idx < scene_count:
             result[idx] = line
     return result
+
+
+def _feedback_targets_start_state(feedback: str) -> bool:
+    normalized = feedback.strip().casefold()
+    if not normalized:
+        return False
+    keywords = (
+        "门不应该开着",
+        "开场不要",
+        "不要先",
+        "不应该已经",
+        "不要拿着",
+        "opening should not",
+        "should not already",
+        "door should not be open",
+        "at the start",
+    )
+    return any(keyword in normalized for keyword in keywords)
 
 
 def _extract_character_candidates(prompt: str) -> list[dict[str, str]]:

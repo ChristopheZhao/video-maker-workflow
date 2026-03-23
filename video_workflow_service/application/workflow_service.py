@@ -7,6 +7,7 @@ from threading import Lock
 import time
 from typing import Any
 from uuid import uuid4
+import zipfile
 
 from video_workflow_service.domain.models import (
     CharacterCard,
@@ -14,13 +15,23 @@ from video_workflow_service.domain.models import (
     Project,
     Scene,
     SceneVideoJob,
+    SubtitleBurnJob,
+    SubtitleJob,
     WorkflowRunJob,
     utc_now,
 )
 from video_workflow_service.infrastructure.config import ServiceSettings, load_settings
-from video_workflow_service.media.ffmpeg_pipeline import compose_clips
+from video_workflow_service.media.ffmpeg_pipeline import (
+    burn_subtitles_into_video,
+    compose_clips,
+    extract_audio_track,
+)
 from video_workflow_service.providers.factory import get_video_provider, list_video_providers
 from video_workflow_service.storage.project_repository import ProjectRepository
+from video_workflow_service.subtitles.formats import render_srt, render_vtt
+from video_workflow_service.subtitles.service import SubtitleAlignmentResult, SubtitleClient
+from video_workflow_service.subtitles.volcengine_asr import VolcengineSpeechAsrClient
+from video_workflow_service.subtitles.volcengine_speech import VolcengineSpeechSubtitleClient
 from video_workflow_service.workflow.contracts import (
     CharacterAnchorInput,
     FinalCompositionInput,
@@ -28,6 +39,8 @@ from video_workflow_service.workflow.contracts import (
     FirstFrameAnalyzeInput,
     LanguageDetectInput,
     PromptOptimizationInput,
+    ScenePromptRevisionInput,
+    ScenePromptRevisionRequest,
     SceneCharacterCastInput,
     SceneCharacterCastSceneInput,
     SceneGenerationInput,
@@ -56,6 +69,7 @@ from video_workflow_service.workflow.scene_planning import plan_scenes_step
 from video_workflow_service.workflow.scene_prompt_render import (
     render_scene_prompt_step,
 )
+from video_workflow_service.workflow.scene_prompt_revise import revise_scene_prompt_step
 from video_workflow_service.workflow.story_plan import (
     distribute_duration,
     story_plan_step,
@@ -71,6 +85,8 @@ class WorkflowService:
         self._futures_lock = Lock()
         self._workflow_futures: dict[str, Future[Project]] = {}
         self._scene_futures: dict[str, Future[Project]] = {}
+        self._subtitle_futures: dict[str, Future[Project]] = {}
+        self._subtitle_burn_futures: dict[str, Future[Project]] = {}
         self.logger = logging.getLogger(__name__)
         self.trace_logger = WorkflowTraceLogger(self.settings)
 
@@ -84,6 +100,7 @@ class WorkflowService:
         provider: str | None = None,
         scene_count: int | None = None,
         workflow_mode: str | None = None,
+        subtitle_mode: str | None = None,
         scene1_first_frame_source: str | None = None,
         scene1_first_frame_image: str | None = None,
         scene1_first_frame_prompt: str | None = None,
@@ -91,6 +108,7 @@ class WorkflowService:
         normalized_workflow_mode = str(workflow_mode or "auto").strip().lower()
         if normalized_workflow_mode not in {"auto", "hitl"}:
             raise ValueError("workflow_mode must be auto or hitl")
+        normalized_subtitle_mode = self._normalize_subtitle_mode(subtitle_mode)
         normalized_scene1_source = self._normalize_scene1_first_frame_source(scene1_first_frame_source)
         normalized_scene1_image = self._normalize_optional_string(scene1_first_frame_image)
         normalized_scene1_prompt = self._normalize_scene1_first_frame_prompt(
@@ -116,6 +134,7 @@ class WorkflowService:
             aspect_ratio=(aspect_ratio or self.settings.default_aspect_ratio).strip(),
             provider=normalized_provider,
             workflow_mode=normalized_workflow_mode,
+            subtitle_mode=normalized_subtitle_mode,
             scene_count=max(1, int(scene_count)) if scene_count is not None else None,
             scene1_first_frame_source=normalized_scene1_source,
             scene1_first_frame_image=normalized_scene1_image,
@@ -129,6 +148,7 @@ class WorkflowService:
             project_id=project.project_id,
             provider=project.provider,
             workflow_mode=project.workflow_mode,
+            subtitle_mode=project.subtitle_mode,
             scene_count=project.scene_count or self.settings.default_scene_count,
             scene1_first_frame_source=project.scene1_first_frame_source,
         )
@@ -752,6 +772,136 @@ class WorkflowService:
         )
         return self.repo.save(project)
 
+    def revise_scene_prompt(self, project_id: str, scene_id: str, payload: dict[str, Any]) -> Project:
+        project = self.repo.load(project_id)
+        scene = self._require_scene(project, scene_id)
+        self._validate_scene_prompt_update(project, scene)
+        contract = ScenePromptRevisionRequest.from_payload(payload)
+        contract.validate()
+
+        if contract.scope == "opening_still_and_prompt":
+            if scene.index != 1:
+                raise ValueError("opening_still_and_prompt is only available for scene-01")
+            if scene.first_frame_source != "auto_generate":
+                raise ValueError("opening_still_and_prompt requires scene-01 auto-generated first frame")
+
+        revision = self._run_scene_prompt_revision(
+            project,
+            scene,
+            feedback=contract.feedback,
+            scope=contract.scope,
+        )
+        if revision.outcome == "requires_start_state_edit":
+            raise ValueError(
+                revision.rejection_reason
+                or "This feedback changes the scene start state and cannot be applied through prompt revision."
+            )
+
+        previous_prompt = scene.prompt
+        previous_first_frame_prompt = scene.first_frame_prompt
+
+        if contract.scope == "opening_still_and_prompt":
+            scene.first_frame_prompt = revision.revised_first_frame_prompt
+            scene.first_frame_image = None
+            scene.first_frame_analysis = {}
+            scene.first_frame_status = "pending"
+            scene.first_frame_origin = None
+            scene.first_frame_job = {}
+            if scene.index == 1:
+                project.scene1_first_frame_prompt = scene.first_frame_prompt
+                project.scene1_first_frame_image = None
+                project.scene1_first_frame_analysis = {}
+                project.scene1_first_frame_status = "pending"
+                project.scene1_first_frame_origin = None
+                project.scene1_first_frame_job = {}
+            prepared = prepare_first_frame_step(
+                FirstFramePrepareInput(
+                    project_id=project.project_id,
+                    provider=project.provider,
+                    scene_id=scene.scene_id,
+                    scene_index=scene.index,
+                    prompt=scene.first_frame_prompt,
+                    aspect_ratio=project.aspect_ratio,
+                ),
+                settings=self.settings,
+                trace_logger=self.trace_logger,
+                project_id=project.project_id,
+            )
+            scene.first_frame_image = prepared.first_frame_image
+            scene.first_frame_prompt = prepared.first_frame_prompt
+            scene.first_frame_origin = prepared.first_frame_origin
+            scene.first_frame_status = prepared.first_frame_status
+            scene.first_frame_job = {
+                "status": "completed",
+                "step": "first_frame_prepare",
+            } | prepared.provider_metadata
+            if scene.index == 1:
+                project.scene1_first_frame_image = scene.first_frame_image
+                project.scene1_first_frame_prompt = scene.first_frame_prompt
+                project.scene1_first_frame_origin = scene.first_frame_origin
+                project.scene1_first_frame_status = scene.first_frame_status
+                project.scene1_first_frame_job = dict(scene.first_frame_job)
+            self._ensure_first_frame_analysis(
+                project,
+                scene,
+                first_frame_image=scene.first_frame_image,
+            )
+            scene_index_map = {item.scene_id: item for item in project.scenes}
+            self._refresh_scene_prompt(project, scene, scene_index_map)
+            revision = self._run_scene_prompt_revision(
+                project,
+                scene,
+                feedback=contract.feedback,
+                scope="prompt_only",
+            )
+            if revision.outcome == "requires_start_state_edit":
+                raise ValueError(
+                    revision.rejection_reason
+                    or "This feedback still conflicts with the updated opening state."
+                )
+
+        scene.prompt = revision.revised_prompt
+        scene.approved_prompt = ""
+        self._clear_scene_prompt_stale(scene)
+        project.add_event(
+            "scene_prompt_revise",
+            "completed",
+            f"Scene {scene.index} prompt revised from feedback",
+            details={
+                "scene_id": scene.scene_id,
+                "scope": contract.scope,
+                "feedback": contract.feedback,
+                "previous_prompt": previous_prompt,
+                "revised_prompt": scene.prompt,
+                "previous_first_frame_prompt": previous_first_frame_prompt,
+                "revised_first_frame_prompt": scene.first_frame_prompt if contract.scope == "opening_still_and_prompt" else "",
+                "change_summary": revision.change_summary,
+                "provider_metadata": revision.provider_metadata,
+            },
+        )
+        self.trace_logger.append(
+            project.project_id,
+            event_type="scene_prompt_revise",
+            step="scene_prompt_revise",
+            status="completed",
+            actor="user",
+            details={
+                "scene_id": scene.scene_id,
+                "scene_index": scene.index,
+                "scope": contract.scope,
+                "feedback": contract.feedback,
+                "change_summary": revision.change_summary,
+            },
+        )
+        self._log(
+            "scene prompt revised",
+            project_id=project.project_id,
+            scene_id=scene.scene_id,
+            scene_index=scene.index,
+            scope=contract.scope,
+        )
+        return self.repo.save(project)
+
     def approve_character_anchor(self, project_id: str, character_id: str) -> Project:
         project = self.repo.load(project_id)
         card = self._require_character_card(project, character_id)
@@ -853,11 +1003,15 @@ class WorkflowService:
         self.repo.save(project)
 
         try:
-            compose_clips(
+            compose_metadata = compose_clips(
                 ffmpeg_bin=self.settings.ffmpeg_bin,
+                ffprobe_bin=self.settings.ffprobe_bin,
                 clip_paths=contract.clip_paths,
                 concat_list_path=output_dir / "concat.txt",
                 output_path=self.settings.artifact_dir / contract.output_rel_path,
+                boundary_trim_seconds=self.settings.composer_boundary_trim_seconds,
+                video_crossfade_seconds=self.settings.composer_video_crossfade_seconds,
+                audio_crossfade_seconds=self.settings.composer_audio_crossfade_seconds,
             )
         except Exception as exc:
             self._mark_final_video_failed(project, job, exc)
@@ -869,10 +1023,13 @@ class WorkflowService:
             metadata={
                 "clip_count": len(contract.clip_paths),
                 "scene_ids": contract.scene_ids,
+                "compose": compose_metadata,
             },
         )
         self._apply_final_composition_output(project, job, result)
-        return self.repo.save(project)
+        saved = self.repo.save(project)
+        self._queue_subtitle_sidecar(saved.project_id)
+        return self.repo.load(project_id)
 
     def run_workflow(self, project_id: str) -> Project:
         return self._execute_workflow_run(project_id)
@@ -941,16 +1098,124 @@ class WorkflowService:
             time.sleep(poll_interval_seconds)
         raise TimeoutError(f"Timed out waiting for workflow run for project {project_id}")
 
+    def wait_for_subtitle_job(
+        self,
+        project_id: str,
+        *,
+        timeout_seconds: float = 180.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> Project:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            project = self.repo.load(project_id)
+            subtitle_job = project.subtitle_job
+            if project.subtitle_mode == "disabled" or self._subtitle_eligibility_reason(project) != "eligible":
+                return project
+            if subtitle_job and subtitle_job.status in {"completed", "failed", "skipped"}:
+                return project
+
+            future = self._get_subtitle_future(project_id)
+            if future and future.done():
+                return future.result()
+            time.sleep(poll_interval_seconds)
+        raise TimeoutError(f"Timed out waiting for subtitle job for project {project_id}")
+
+    def wait_for_subtitle_burn_job(
+        self,
+        project_id: str,
+        *,
+        timeout_seconds: float = 180.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> Project:
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            project = self.repo.load(project_id)
+            subtitle_burn_job = project.subtitle_burn_job
+            if subtitle_burn_job and subtitle_burn_job.status in {"completed", "failed"}:
+                return project
+
+            future = self._get_subtitle_burn_future(project_id)
+            if future and future.done():
+                return future.result()
+            time.sleep(poll_interval_seconds)
+        raise TimeoutError(f"Timed out waiting for subtitle burn export for project {project_id}")
+
+    def build_delivery_package(self, project_id: str) -> Path:
+        project = self.repo.load(project_id)
+        if not project.final_video_rel_path:
+            raise ValueError("Final video is not ready.")
+        if not project.subtitle_srt_rel_path and not project.subtitle_vtt_rel_path:
+            raise ValueError("Subtitle files are not ready.")
+
+        delivery_dir = self.settings.artifact_dir / project.project_id / "delivery"
+        delivery_dir.mkdir(parents=True, exist_ok=True)
+        package_path = delivery_dir / "final_delivery.zip"
+
+        with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            final_video_path = self.settings.artifact_dir / str(project.final_video_rel_path)
+            archive.write(final_video_path, arcname="final.mp4")
+            if project.subtitle_srt_rel_path:
+                archive.write(
+                    self.settings.artifact_dir / str(project.subtitle_srt_rel_path),
+                    arcname="final.srt",
+                )
+            if project.subtitle_vtt_rel_path:
+                archive.write(
+                    self.settings.artifact_dir / str(project.subtitle_vtt_rel_path),
+                    arcname="final.vtt",
+                )
+
+        return package_path
+
+    def export_subtitled_video(self, project_id: str) -> Project:
+        project = self.repo.load(project_id)
+        if not project.final_video_rel_path:
+            raise ValueError("Final video is not ready.")
+        if not project.subtitle_srt_rel_path:
+            raise ValueError("Subtitle files are not ready.")
+
+        current_job = project.subtitle_burn_job
+        if current_job and current_job.status in {"queued", "running"}:
+            raise ValueError(f"Subtitled video export already active: {current_job.job_id}")
+
+        if project.subtitle_burned_video_rel_path:
+            (self.settings.artifact_dir / str(project.subtitle_burned_video_rel_path)).unlink(missing_ok=True)
+            project.subtitle_burned_video_rel_path = None
+
+        job = SubtitleBurnJob(
+            job_id=f"sbj_{uuid4().hex[:10]}",
+            status="queued",
+            provider="ffmpeg",
+            metadata={"source_video_rel_path": project.final_video_rel_path},
+        )
+        project.subtitle_burn_job = job
+        project.add_event(
+            "subtitle_burn",
+            "queued",
+            "Subtitled video export queued",
+            details={"job_id": job.job_id, "provider": job.provider},
+        )
+        self.repo.save(project)
+        future = self._executor.submit(self._execute_subtitle_burn_export, project_id, job.job_id)
+        with self._futures_lock:
+            self._subtitle_burn_futures[project_id] = future
+        return self.repo.load(project_id)
+
     def serialize_project(self, project: Project, *, base_url: str | None = None) -> dict[str, Any]:
         payload = project.to_dict()
+        payload["subtitle_mode"] = self._public_subtitle_mode(project.subtitle_mode)
         if base_url:
             payload["final_video_url"] = self._artifact_url(project.final_video_rel_path, base_url)
+            payload["subtitle_srt_url"] = self._artifact_url(project.subtitle_srt_rel_path, base_url)
+            payload["subtitle_vtt_url"] = self._artifact_url(project.subtitle_vtt_rel_path, base_url)
+            payload["subtitle_burned_video_url"] = self._artifact_url(project.subtitle_burned_video_rel_path, base_url)
             for card in payload.get("character_cards", []):
                 card["reference_image_url"] = self._first_frame_url(card.get("reference_image"), base_url)
             for scene in payload.get("scenes", []):
                 scene["video_url"] = self._artifact_url(scene.get("video_rel_path"), base_url)
                 scene["final_frame_url"] = self._artifact_url(scene.get("final_frame_rel_path"), base_url)
                 scene["first_frame_url"] = self._first_frame_url(scene.get("first_frame_image"), base_url)
+        payload["subtitle"] = self._serialize_subtitle_state(project, base_url=base_url)
         payload["hitl"] = self._serialize_hitl_state(project)
         scene_map = {scene.scene_id: scene for scene in project.scenes}
         for scene_payload in payload.get("scenes", []):
@@ -965,6 +1230,18 @@ class WorkflowService:
         if normalized not in {"upload", "auto_generate"}:
             raise ValueError("scene1_first_frame_source must be upload or auto_generate")
         return normalized
+
+    def _normalize_subtitle_mode(self, subtitle_mode: str | None) -> str:
+        normalized = str(subtitle_mode or "disabled").strip().lower()
+        if normalized == "sidecar":
+            return "enabled"
+        if normalized not in {"disabled", "enabled"}:
+            raise ValueError("subtitle_mode must be disabled or enabled")
+        return normalized
+
+    def _public_subtitle_mode(self, subtitle_mode: str | None) -> str:
+        normalized = str(subtitle_mode or "disabled").strip().lower()
+        return "disabled" if normalized == "disabled" else "enabled"
 
     def _normalize_optional_string(self, value: str | None) -> str | None:
         if not isinstance(value, str):
@@ -988,6 +1265,74 @@ class WorkflowService:
         if not rel_path:
             return None
         return f"{base_url.rstrip('/')}/artifacts/{rel_path}"
+
+    def _project_has_spoken_dialogue(self, project: Project) -> bool:
+        return any(
+            str(scene.speech_mode or "").strip().lower() != "none" and str(scene.spoken_text or "").strip()
+            for scene in project.scenes
+        )
+
+    def _subtitle_eligibility_reason(self, project: Project) -> str:
+        if project.subtitle_mode == "disabled":
+            return "subtitle_mode_disabled"
+        if not self._project_has_spoken_dialogue(project):
+            return "no_spoken_dialogue"
+        return "eligible"
+
+    def _serialize_subtitle_state(self, project: Project, *, base_url: str | None = None) -> dict[str, Any]:
+        reason = self._subtitle_eligibility_reason(project)
+        eligible = reason == "eligible"
+        srt_url = self._artifact_url(project.subtitle_srt_rel_path, base_url) if base_url else None
+        vtt_url = self._artifact_url(project.subtitle_vtt_rel_path, base_url) if base_url else None
+        burned_video_url = self._artifact_url(project.subtitle_burned_video_rel_path, base_url) if base_url else None
+        subtitle_job = project.subtitle_job
+        subtitle_burn_job = project.subtitle_burn_job
+        subtitle_ready = bool(project.subtitle_srt_rel_path or project.subtitle_vtt_rel_path)
+        public_mode = self._public_subtitle_mode(project.subtitle_mode)
+
+        if project.subtitle_mode == "disabled":
+            status = "disabled"
+        elif subtitle_ready:
+            status = "completed"
+        elif subtitle_job and subtitle_job.status:
+            status = subtitle_job.status
+        elif not eligible:
+            status = "not_applicable"
+        elif project.final_video_rel_path:
+            status = "pending"
+        else:
+            status = "planned"
+
+        if project.subtitle_mode == "disabled":
+            burn_status = "disabled"
+        elif project.subtitle_burned_video_rel_path:
+            burn_status = "completed"
+        elif subtitle_burn_job and subtitle_burn_job.status:
+            burn_status = subtitle_burn_job.status
+        else:
+            burn_status = "idle"
+
+        return {
+            "mode": public_mode,
+            "enabled": project.subtitle_mode != "disabled",
+            "eligible": eligible,
+            "status": status,
+            "reason": reason,
+            "srt_rel_path": project.subtitle_srt_rel_path,
+            "vtt_rel_path": project.subtitle_vtt_rel_path,
+            "srt_url": srt_url,
+            "vtt_url": vtt_url,
+            "package_url": f"{base_url.rstrip('/')}/projects/{project.project_id}/delivery-package" if base_url and subtitle_ready else None,
+            "language": project.audio_language or project.dialogue_language or project.detected_input_language or "",
+            "job_id": subtitle_job.job_id if subtitle_job else None,
+            "provider": subtitle_job.provider if subtitle_job else None,
+            "error_message": subtitle_job.error_message if subtitle_job else None,
+            "burned_video_rel_path": project.subtitle_burned_video_rel_path,
+            "burned_video_url": burned_video_url,
+            "burn_status": burn_status,
+            "burn_job_id": subtitle_burn_job.job_id if subtitle_burn_job else None,
+            "burn_error_message": subtitle_burn_job.error_message if subtitle_burn_job else None,
+        }
 
     def _first_frame_url(self, image_ref: str | None, base_url: str) -> str | None:
         if not image_ref:
@@ -1049,13 +1394,14 @@ class WorkflowService:
 
     def _ensure_project_scene1_first_frame_context(self, project: Project) -> None:
         if project.scene1_first_frame_source == "auto_generate" and not project.scene1_first_frame_image:
+            prepared_prompt = self._compose_project_opening_first_frame_prompt(project)
             prepared = prepare_first_frame_step(
                 FirstFramePrepareInput(
                     project_id=project.project_id,
                     provider=project.provider,
                     scene_id="scene-01",
                     scene_index=1,
-                    prompt=project.scene1_first_frame_prompt or project.raw_prompt,
+                    prompt=prepared_prompt,
                     aspect_ratio=project.aspect_ratio,
                 ),
                 settings=self.settings,
@@ -1439,17 +1785,90 @@ class WorkflowService:
             return True
         if scene.first_frame_origin != "generated":
             return False
-        if scene.index == 1 and project.scene1_first_frame_prompt.strip() != project.raw_prompt.strip():
-            return False
+        if scene.index == 1:
+            project_level_prompt = self._compose_project_opening_first_frame_prompt(project)
+            if project.scene1_first_frame_prompt.strip() != project_level_prompt.strip():
+                return False
         return scene.first_frame_prompt.strip() != prepared_prompt.strip()
+
+    def _compose_project_opening_first_frame_prompt(self, project: Project) -> str:
+        parts: list[str] = []
+        default_project_prompt = project.raw_prompt.strip()
+        base_prompt = project.scene1_first_frame_prompt.strip()
+        if self._is_system_opening_state_first_frame_prompt(base_prompt, project.detected_input_language):
+            base_prompt = ""
+        if base_prompt and not self._prompt_text_matches(base_prompt, default_project_prompt):
+            parts.append(base_prompt.rstrip("."))
+        elif default_project_prompt:
+            parts.append(default_project_prompt.rstrip("."))
+        prompt_brief = ". ".join(self._dedupe_prompt_parts(parts)) if parts else default_project_prompt
+        return self._wrap_opening_state_first_frame_prompt(
+            prompt_brief,
+            input_language=project.detected_input_language,
+            scene_index=1,
+        )
+
+    def _wrap_opening_state_first_frame_prompt(
+        self,
+        prompt_brief: str,
+        *,
+        input_language: str | None,
+        scene_index: int,
+    ) -> str:
+        normalized_brief = prompt_brief.strip()
+        if not normalized_brief:
+            return ""
+        if str(input_language or "").strip().lower() == "zh":
+            return (
+                "开场起点图说明：\n"
+                f"{normalized_brief}\n\n"
+                f"只生成第{scene_index}场在 t=0 时刻的单张起点图。"
+                "只表现这个场景最开始已经真实存在的稳定状态，不要把后续时间线、结果、目标达成、救援完成、逃脱成功、门已打开、到达目的地、团聚、分屏、前后对照或转场过渡压缩进同一张图。"
+                "如果角色只是向往某个地点或结果，不要把那个目标地点直接画成开场已发生的现实场景，除非这一场一开始就发生在那里。"
+                "不要提前泄露后续场景才会出现的人物、动作结果或环境变化。"
+                "只保留开场时刻真实需要出现的人物、道具和环境。"
+            )
+        return (
+            "Opening still brief:\n"
+            f"{normalized_brief}\n\n"
+            f"Generate a single opening-state still for scene {scene_index} at t=0. "
+            "Show only the earliest stable state that is already true when the scene begins. "
+            "Do not compress later timeline beats, outcomes, achieved goals, completed rescues, successful escapes, already-open escape routes, destination arrivals, reunions, split-screen contrasts, or before/after transitions into the same frame. "
+            "If the story mentions a desired place or future outcome, do not show it as a literal achieved reality unless the scene truly starts there. "
+            "Do not introduce characters, environmental changes, or result states that belong to later scenes. "
+            "Keep only the characters, props, and setting elements that are genuinely present at the opening moment."
+        )
+
+    def _is_system_opening_state_first_frame_prompt(
+        self,
+        prompt_text: str,
+        input_language: str | None,
+    ) -> bool:
+        normalized_prompt = prompt_text.strip()
+        if not normalized_prompt:
+            return False
+        prefix = (
+            "开场起点图说明：\n"
+            if str(input_language or "").strip().lower() == "zh"
+            else "Opening still brief:\n"
+        )
+        return normalized_prompt.startswith(prefix) and "\n\n" in normalized_prompt
+
+    def _prompt_text_matches(self, left: str, right: str) -> bool:
+        punctuation = " \t\r\n.。!！?？"
+        normalized_left = " ".join(left.strip().rstrip(punctuation).split()).casefold()
+        normalized_right = " ".join(right.strip().rstrip(punctuation).split()).casefold()
+        return bool(normalized_left) and normalized_left == normalized_right
 
     def _compose_scene_auto_generated_first_frame_prompt(self, project: Project, scene: Scene) -> str:
         parts: list[str] = []
         narrative = scene.narrative.strip()
         visual_goal = scene.visual_goal.strip()
         base_prompt = scene.first_frame_prompt.strip()
+        if self._is_system_opening_state_first_frame_prompt(base_prompt, project.detected_input_language):
+            base_prompt = ""
         default_project_prompt = project.raw_prompt.strip()
-        if base_prompt and base_prompt != default_project_prompt:
+        if base_prompt and not self._prompt_text_matches(base_prompt, default_project_prompt):
             parts.append(base_prompt.rstrip("."))
         if narrative:
             parts.append(narrative.rstrip("."))
@@ -1459,8 +1878,14 @@ class WorkflowService:
         if character_prompt:
             parts.append(character_prompt.rstrip("."))
         if not parts:
-            return base_prompt or default_project_prompt
-        return ". ".join(self._dedupe_prompt_parts(parts)) + "."
+            prompt_brief = base_prompt or default_project_prompt
+        else:
+            prompt_brief = ". ".join(self._dedupe_prompt_parts(parts))
+        return self._wrap_opening_state_first_frame_prompt(
+            prompt_brief,
+            input_language=project.detected_input_language,
+            scene_index=scene.index,
+        )
 
     def _scene_character_first_frame_hint(self, project: Project, scene: Scene) -> str:
         cards = self._scene_approved_lookdev_cards(project, scene) or self._scene_character_cards(project, scene)
@@ -1509,6 +1934,79 @@ class WorkflowService:
             deduped.append(value)
             seen.add(normalized)
         return deduped
+
+    def _run_scene_prompt_revision(
+        self,
+        project: Project,
+        scene: Scene,
+        *,
+        feedback: str,
+        scope: str,
+    ):
+        prompt_optimize_details = self._latest_event_details(project, "prompt_optimize")
+        project_guidance = build_project_guidance_context(
+            step_name="scene_prompt_revise",
+            target_duration_seconds=project.target_duration_seconds,
+            scene_count=max(1, project.scene_count or self.settings.default_scene_count),
+            input_language=project.detected_input_language,
+            dialogue_language=project.dialogue_language,
+            audio_language=project.audio_language,
+            language_confidence=project.language_detection_confidence,
+            creative_intent=str(prompt_optimize_details.get("creative_intent", "")),
+            style_guardrails=list(prompt_optimize_details.get("style_guardrails", [])),
+            planning_notes=str(prompt_optimize_details.get("planning_notes", "")),
+            dialogue_lines=list(prompt_optimize_details.get("dialogue_lines", [])),
+            scene1_first_frame_source=project.scene1_first_frame_source,
+            scene1_first_frame_prompt=project.scene1_first_frame_prompt,
+            scene1_first_frame_analysis=dict(project.scene1_first_frame_analysis),
+        )
+        scene_guidance = build_scene_guidance_context(
+            step_name="scene_prompt_revise",
+            working_prompt=scene.prompt,
+            spoken_text=scene.spoken_text,
+            speech_mode=scene.speech_mode,
+            delivery_notes=scene.delivery_notes,
+            dialogue_language=project.dialogue_language,
+            audio_language=project.audio_language,
+            character_cards=self._scene_character_cards(project, scene),
+            participating_character_ids=scene.participating_character_ids,
+            primary_character_id=scene.primary_character_id,
+            character_presence_notes=scene.character_presence_notes,
+            first_frame_source=scene.first_frame_source,
+            first_frame_analysis=dict(scene.first_frame_analysis),
+            continuity_notes=scene.continuity_notes,
+            first_frame_prompt=scene.first_frame_prompt,
+        )
+        return revise_scene_prompt_step(
+            ScenePromptRevisionInput(
+                scene_id=scene.scene_id,
+                scene_index=scene.index,
+                scene_count=max(1, project.scene_count or self.settings.default_scene_count),
+                raw_prompt=project.raw_prompt,
+                current_prompt=scene.prompt or scene.rendered_prompt,
+                current_rendered_prompt=scene.rendered_prompt,
+                title=scene.title,
+                narrative=scene.narrative,
+                visual_goal=scene.visual_goal,
+                spoken_text=scene.spoken_text,
+                speech_mode=scene.speech_mode,
+                delivery_notes=scene.delivery_notes,
+                continuity_notes=scene.continuity_notes,
+                first_frame_source=scene.first_frame_source,
+                first_frame_prompt=scene.first_frame_prompt,
+                first_frame_analysis=dict(scene.first_frame_analysis),
+                input_language=project.detected_input_language,
+                dialogue_language=project.dialogue_language,
+                audio_language=project.audio_language,
+                feedback=feedback,
+                requested_scope=scope,
+                project_guidance_context=project_guidance,
+                scene_guidance_context=scene_guidance,
+            ),
+            settings=self.settings,
+            trace_logger=self.trace_logger,
+            project_id=project.project_id,
+        )
 
     def _refresh_scene_prompt(
         self,
@@ -2038,6 +2536,7 @@ class WorkflowService:
         project: Project,
         contract: FinalCompositionInput,
     ) -> FinalVideoJob:
+        self._clear_existing_subtitle_delivery(project)
         previous_attempts = project.final_video_job.attempt_count if project.final_video_job else 0
         job = FinalVideoJob(
             job_id=f"fvg_{uuid4().hex[:10]}",
@@ -2116,6 +2615,373 @@ class WorkflowService:
             job_id=job.job_id,
             final_video_rel_path=result.final_video_rel_path,
         )
+
+    def _queue_subtitle_sidecar(self, project_id: str) -> None:
+        project = self.repo.load(project_id)
+        if project.subtitle_mode == "disabled":
+            project.subtitle_job = None
+            self.repo.save(project)
+            return
+
+        if self._subtitle_eligibility_reason(project) != "eligible":
+            project.subtitle_job = None
+            self.repo.save(project)
+            return
+
+        if not self._subtitle_service_is_configured():
+            project.subtitle_job = SubtitleJob(
+                job_id=f"stj_{uuid4().hex[:10]}",
+                status="skipped",
+                provider=self.settings.subtitle_service_name,
+                mode=project.subtitle_mode,
+                completed_at=utc_now(),
+                error_message="Subtitle service is not configured.",
+                metadata={"skip_reason": "subtitle_service_not_configured"},
+            )
+            project.add_event(
+                "subtitle_align",
+                "skipped",
+                "Subtitle sidecar skipped because subtitle service is not configured",
+                details={"provider": self.settings.subtitle_service_name},
+            )
+            self.repo.save(project)
+            return
+
+        subtitle_job = SubtitleJob(
+            job_id=f"stj_{uuid4().hex[:10]}",
+            status="queued",
+            provider=self.settings.subtitle_service_name,
+            mode=project.subtitle_mode,
+            metadata={"alignment_strategy": "text_alignment"},
+        )
+        project.subtitle_job = subtitle_job
+        project.add_event(
+            "subtitle_align",
+            "queued",
+            "Subtitle sidecar queued after final composition",
+            details={
+                "job_id": subtitle_job.job_id,
+                "provider": subtitle_job.provider,
+                "mode": subtitle_job.mode,
+            },
+        )
+        self.repo.save(project)
+        future = self._executor.submit(
+            self._execute_subtitle_generation,
+            project_id,
+            subtitle_job.job_id,
+        )
+        with self._futures_lock:
+            self._subtitle_futures[project_id] = future
+
+    def _execute_subtitle_burn_export(self, project_id: str, subtitle_burn_job_id: str) -> Project:
+        try:
+            project = self.repo.load(project_id)
+            subtitle_burn_job = project.subtitle_burn_job
+            if subtitle_burn_job is None or subtitle_burn_job.job_id != subtitle_burn_job_id:
+                return project
+
+            subtitle_burn_job.status = "running"
+            subtitle_burn_job.started_at = utc_now()
+            subtitle_burn_job.error_message = None
+            self.repo.save(project)
+            self._log(
+                "subtitle burn export started",
+                project_id=project.project_id,
+                job_id=subtitle_burn_job.job_id,
+                provider=subtitle_burn_job.provider,
+            )
+
+            if not project.final_video_rel_path or not project.subtitle_srt_rel_path:
+                raise RuntimeError("Subtitled video export requires final video and SRT subtitles.")
+
+            output_rel_path = f"{project.project_id}/delivery/final_burned.mp4"
+            burn_subtitles_into_video(
+                ffmpeg_bin=self.settings.ffmpeg_bin,
+                video_path=self.settings.artifact_dir / str(project.final_video_rel_path),
+                subtitle_path=self.settings.artifact_dir / str(project.subtitle_srt_rel_path),
+                output_path=self.settings.artifact_dir / output_rel_path,
+            )
+            return self._apply_subtitle_burn_output(project_id, subtitle_burn_job_id, output_rel_path)
+        except Exception as exc:
+            return self._mark_subtitle_burn_failed(project_id, subtitle_burn_job_id, exc)
+        finally:
+            self._release_subtitle_burn_future(project_id, subtitle_burn_job_id)
+
+    def _execute_subtitle_generation(self, project_id: str, subtitle_job_id: str) -> Project:
+        audio_path: Path | None = None
+        try:
+            project = self.repo.load(project_id)
+            subtitle_job = project.subtitle_job
+            if subtitle_job is None or subtitle_job.job_id != subtitle_job_id:
+                return project
+
+            subtitle_job.status = "running"
+            subtitle_job.started_at = utc_now()
+            subtitle_job.error_message = None
+            self.repo.save(project)
+            self._log(
+                "subtitle generation started",
+                project_id=project.project_id,
+                job_id=subtitle_job.job_id,
+                provider=subtitle_job.provider,
+            )
+
+            final_video_path = self.settings.artifact_dir / str(project.final_video_rel_path)
+            delivery_dir = final_video_path.parent
+            audio_path = delivery_dir / "final.subtitle-input.wav"
+            extract_audio_track(
+                ffmpeg_bin=self.settings.ffmpeg_bin,
+                video_path=final_video_path,
+                output_path=audio_path,
+            )
+
+            language = project.audio_language or project.dialogue_language or project.detected_input_language
+            subtitle_text = self._build_project_subtitle_text(project)
+            try:
+                result = self._build_subtitle_client().align_known_text(
+                    audio_path=audio_path,
+                    subtitle_text=subtitle_text,
+                    language=language,
+                )
+            except Exception as primary_error:
+                self._log(
+                    "subtitle text alignment failed; attempting ASR fallback",
+                    project_id=project.project_id,
+                    job_id=subtitle_job.job_id,
+                    error=str(primary_error),
+                )
+                result = self._run_subtitle_asr_fallback(
+                    audio_path=audio_path,
+                    language=language,
+                    primary_error=primary_error,
+                )
+            return self._apply_subtitle_alignment_result(project_id, subtitle_job_id, result)
+        except Exception as exc:
+            return self._mark_subtitle_job_failed(project_id, subtitle_job_id, exc)
+        finally:
+            if audio_path is not None and audio_path.exists():
+                audio_path.unlink(missing_ok=True)
+            self._release_subtitle_future(project_id, subtitle_job_id)
+
+    def _run_subtitle_asr_fallback(
+        self,
+        *,
+        audio_path: Path,
+        language: str | None,
+        primary_error: Exception,
+    ) -> SubtitleAlignmentResult:
+        if not self._subtitle_asr_fallback_is_configured():
+            raise RuntimeError(
+                "Subtitle text alignment failed and ASR fallback is unavailable. "
+                f"Primary error: {primary_error}"
+            ) from primary_error
+
+        result = self._build_subtitle_asr_client().recognize_audio(
+            audio_path=audio_path,
+            language=language,
+        )
+        result.metadata["fallback_from"] = "text_alignment"
+        result.metadata["fallback_reason"] = str(primary_error)
+        return result
+
+    def _apply_subtitle_alignment_result(
+        self,
+        project_id: str,
+        subtitle_job_id: str,
+        result: SubtitleAlignmentResult,
+    ) -> Project:
+        project = self.repo.load(project_id)
+        subtitle_job = project.subtitle_job
+        if subtitle_job is None or subtitle_job.job_id != subtitle_job_id:
+            return project
+
+        srt_rel_path = f"{project.project_id}/delivery/final.srt"
+        vtt_rel_path = f"{project.project_id}/delivery/final.vtt"
+        srt_path = self.settings.artifact_dir / srt_rel_path
+        vtt_path = self.settings.artifact_dir / vtt_rel_path
+        srt_path.parent.mkdir(parents=True, exist_ok=True)
+        vtt_path.parent.mkdir(parents=True, exist_ok=True)
+        srt_path.write_text(render_srt(result.cues), encoding="utf-8")
+        vtt_path.write_text(render_vtt(result.cues), encoding="utf-8")
+
+        project.subtitle_srt_rel_path = srt_rel_path
+        project.subtitle_vtt_rel_path = vtt_rel_path
+        subtitle_job.status = "completed"
+        subtitle_job.completed_at = utc_now()
+        subtitle_job.provider = result.provider
+        subtitle_job.provider_task_id = str(result.metadata.get("task_id") or "") or None
+        subtitle_job.metadata = dict(result.metadata)
+        subtitle_job.metadata["alignment_strategy"] = result.alignment_strategy
+
+        project.add_event(
+            "subtitle_align",
+            "completed",
+            "Subtitle timestamps aligned against final delivery audio",
+            details={
+                "job_id": subtitle_job.job_id,
+                "provider": subtitle_job.provider,
+                "alignment_strategy": result.alignment_strategy,
+                "cue_count": len(result.cues),
+            },
+        )
+        project.add_event(
+            "subtitle_publish",
+            "completed",
+            "Subtitle sidecar assets ready",
+            details={
+                "srt_rel_path": srt_rel_path,
+                "vtt_rel_path": vtt_rel_path,
+            },
+        )
+        self._log(
+            "subtitle generation completed",
+            project_id=project.project_id,
+            job_id=subtitle_job.job_id,
+            alignment_strategy=result.alignment_strategy,
+            cue_count=len(result.cues),
+        )
+        return self.repo.save(project)
+
+    def _mark_subtitle_job_failed(
+        self,
+        project_id: str,
+        subtitle_job_id: str,
+        error: Exception,
+    ) -> Project:
+        project = self.repo.load(project_id)
+        subtitle_job = project.subtitle_job
+        if subtitle_job is None or subtitle_job.job_id != subtitle_job_id:
+            return project
+        subtitle_job.status = "failed"
+        subtitle_job.failed_at = utc_now()
+        subtitle_job.error_message = str(error)
+        project.add_event(
+            "subtitle_align",
+            "failed",
+            "Subtitle sidecar generation failed",
+            details={"job_id": subtitle_job.job_id, "error": str(error)},
+        )
+        self._log(
+            "subtitle generation failed",
+            project_id=project.project_id,
+            job_id=subtitle_job.job_id,
+            error=str(error),
+        )
+        return self.repo.save(project)
+
+    def _apply_subtitle_burn_output(
+        self,
+        project_id: str,
+        subtitle_burn_job_id: str,
+        output_rel_path: str,
+    ) -> Project:
+        project = self.repo.load(project_id)
+        subtitle_burn_job = project.subtitle_burn_job
+        if subtitle_burn_job is None or subtitle_burn_job.job_id != subtitle_burn_job_id:
+            return project
+
+        project.subtitle_burned_video_rel_path = output_rel_path
+        subtitle_burn_job.status = "completed"
+        subtitle_burn_job.completed_at = utc_now()
+        subtitle_burn_job.output_rel_path = output_rel_path
+        project.add_event(
+            "subtitle_burn",
+            "completed",
+            "Subtitled video export completed",
+            details={
+                "job_id": subtitle_burn_job.job_id,
+                "output_rel_path": output_rel_path,
+            },
+        )
+        project.add_event(
+            "delivery_publish",
+            "completed",
+            "Subtitled delivery asset ready",
+            details={"subtitle_burned_video_rel_path": output_rel_path},
+        )
+        self._log(
+            "subtitle burn export completed",
+            project_id=project.project_id,
+            job_id=subtitle_burn_job.job_id,
+            output_rel_path=output_rel_path,
+        )
+        return self.repo.save(project)
+
+    def _mark_subtitle_burn_failed(
+        self,
+        project_id: str,
+        subtitle_burn_job_id: str,
+        error: Exception,
+    ) -> Project:
+        project = self.repo.load(project_id)
+        subtitle_burn_job = project.subtitle_burn_job
+        if subtitle_burn_job is None or subtitle_burn_job.job_id != subtitle_burn_job_id:
+            return project
+        subtitle_burn_job.status = "failed"
+        subtitle_burn_job.failed_at = utc_now()
+        subtitle_burn_job.error_message = str(error)
+        project.add_event(
+            "subtitle_burn",
+            "failed",
+            "Subtitled video export failed",
+            details={"job_id": subtitle_burn_job.job_id, "error": str(error)},
+        )
+        self._log(
+            "subtitle burn export failed",
+            project_id=project.project_id,
+            job_id=subtitle_burn_job.job_id,
+            error=str(error),
+        )
+        return self.repo.save(project)
+
+    def _build_project_subtitle_text(self, project: Project) -> str:
+        lines: list[str] = []
+        for scene in project.scenes:
+            if scene.speech_mode == "none":
+                continue
+            spoken_text = scene.spoken_text.strip()
+            if not spoken_text:
+                continue
+            lines.append(spoken_text)
+        return "\n".join(lines).strip()
+
+    def _subtitle_service_is_configured(self) -> bool:
+        if self.settings.subtitle_service_name == "volcengine_speech":
+            return bool(
+                self.settings.volcengine_speech_app_id
+                and self.settings.volcengine_speech_access_token
+            )
+        return False
+
+    def _subtitle_asr_fallback_is_configured(self) -> bool:
+        return self._subtitle_service_is_configured()
+
+    def _build_subtitle_client(self) -> SubtitleClient:
+        if self.settings.subtitle_service_name == "volcengine_speech":
+            return VolcengineSpeechSubtitleClient(self.settings)
+        raise ValueError(f"Unsupported subtitle service: {self.settings.subtitle_service_name}")
+
+    def _build_subtitle_asr_client(self) -> VolcengineSpeechAsrClient:
+        if self.settings.subtitle_service_name == "volcengine_speech":
+            return VolcengineSpeechAsrClient(self.settings)
+        raise ValueError(f"Unsupported subtitle service: {self.settings.subtitle_service_name}")
+
+    def _clear_existing_subtitle_delivery(self, project: Project) -> None:
+        for rel_path in (
+            project.subtitle_srt_rel_path,
+            project.subtitle_vtt_rel_path,
+            project.subtitle_burned_video_rel_path,
+            f"{project.project_id}/delivery/final_delivery.zip",
+        ):
+            if not rel_path:
+                continue
+            (self.settings.artifact_dir / rel_path).unlink(missing_ok=True)
+        project.subtitle_srt_rel_path = None
+        project.subtitle_vtt_rel_path = None
+        project.subtitle_burned_video_rel_path = None
+        project.subtitle_job = None
+        project.subtitle_burn_job = None
 
     def _begin_workflow_run(
         self,
@@ -2308,6 +3174,22 @@ class WorkflowService:
                 return None
             return future
 
+    def _get_subtitle_future(self, project_id: str) -> Future[Project] | None:
+        with self._futures_lock:
+            future = self._subtitle_futures.get(project_id)
+            if future and future.done():
+                self._subtitle_futures.pop(project_id, None)
+                return None
+            return future
+
+    def _get_subtitle_burn_future(self, project_id: str) -> Future[Project] | None:
+        with self._futures_lock:
+            future = self._subtitle_burn_futures.get(project_id)
+            if future and future.done():
+                self._subtitle_burn_futures.pop(project_id, None)
+                return None
+            return future
+
     def _scene_duration_bounds(self, provider_name: str) -> tuple[int, int] | None:
         capabilities = get_video_provider(self.settings, provider_name).get_capabilities()
         min_duration = capabilities.get("min_scene_duration_seconds")
@@ -2358,6 +3240,20 @@ class WorkflowService:
             current_job = current_scene.video_job if current_scene else None
             if current_job is not None and current_job.job_id == scene_job_id:
                 self._scene_futures.pop(project_id, None)
+
+    def _release_subtitle_future(self, project_id: str, subtitle_job_id: str) -> None:
+        with self._futures_lock:
+            current_project = self.repo.load(project_id)
+            current_job = current_project.subtitle_job
+            if current_job is not None and current_job.job_id == subtitle_job_id:
+                self._subtitle_futures.pop(project_id, None)
+
+    def _release_subtitle_burn_future(self, project_id: str, subtitle_burn_job_id: str) -> None:
+        with self._futures_lock:
+            current_project = self.repo.load(project_id)
+            current_job = current_project.subtitle_burn_job
+            if current_job is not None and current_job.job_id == subtitle_burn_job_id:
+                self._subtitle_burn_futures.pop(project_id, None)
 
     def _log(self, message: str, **fields: Any) -> None:
         details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)

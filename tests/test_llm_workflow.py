@@ -44,6 +44,7 @@ class LLMWorkflowTestCase(unittest.TestCase):
                         "VIDEO_WORKFLOW_LLM_STORY_PLAN_MODEL=doubao-story-plan-pro",
                         "VIDEO_WORKFLOW_LLM_SCENE_PLAN_MODEL=doubao-scene-plan-pro",
                         "VIDEO_WORKFLOW_LLM_DIALOGUE_ALLOCATE_MODEL=doubao-dialogue-pro",
+                        "VIDEO_WORKFLOW_LLM_SCENE_PROMPT_REVISE_MODEL=doubao-revise-pro",
                         "VIDEO_WORKFLOW_LLM_SCENE_PROMPT_RENDER_MODEL=doubao-render-pro",
                     ]
                 ),
@@ -56,6 +57,7 @@ class LLMWorkflowTestCase(unittest.TestCase):
             self.assertEqual(resolve_llm_model(settings, "story_plan"), "doubao-story-plan-pro")
             self.assertEqual(resolve_llm_model(settings, "scene_plan"), "doubao-scene-plan-pro")
             self.assertEqual(resolve_llm_model(settings, "dialogue_allocate"), "doubao-dialogue-pro")
+            self.assertEqual(resolve_llm_model(settings, "scene_prompt_revise"), "doubao-revise-pro")
             self.assertEqual(resolve_llm_model(settings, "scene_prompt_render"), "doubao-render-pro")
 
     def test_model_registry_uses_deepseek_default_model_for_deepseek_provider(self) -> None:
@@ -88,6 +90,7 @@ class LLMWorkflowTestCase(unittest.TestCase):
                         "VIDEO_WORKFLOW_LLM_PROVIDER=doubao",
                         "VIDEO_WORKFLOW_LLM_PROMPT_OPTIMIZE_PROVIDER=deepseek",
                         "VIDEO_WORKFLOW_LLM_DIALOGUE_ALLOCATE_PROVIDER=deepseek",
+                        "VIDEO_WORKFLOW_LLM_SCENE_PROMPT_REVISE_PROVIDER=deepseek",
                     ]
                 ),
                 encoding="utf-8",
@@ -95,6 +98,7 @@ class LLMWorkflowTestCase(unittest.TestCase):
             settings = load_settings(root)
             self.assertEqual(resolve_llm_provider_name(settings, "prompt_optimize"), "deepseek")
             self.assertEqual(resolve_llm_provider_name(settings, "dialogue_allocate"), "deepseek")
+            self.assertEqual(resolve_llm_provider_name(settings, "scene_prompt_revise"), "deepseek")
             self.assertEqual(resolve_llm_provider_name(settings, "scene_plan"), "doubao")
 
     def test_doubao_llm_provider_parses_chat_completion_response(self) -> None:

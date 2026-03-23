@@ -7,9 +7,11 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+import zipfile
 
 from video_workflow_service import WorkflowService, load_settings
-from video_workflow_service.domain.models import SceneVideoJob
+from video_workflow_service.domain.models import Scene, SceneVideoJob, SubtitleJob
+from video_workflow_service.subtitles.service import SubtitleAlignmentResult, SubtitleCue
 
 
 class WorkflowServiceTestCase(unittest.TestCase):
@@ -27,6 +29,23 @@ class WorkflowServiceTestCase(unittest.TestCase):
                     scene_count=2,
                     workflow_mode="hitl",
                 )
+
+    def test_create_project_persists_subtitle_mode(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+
+            project = service.create_project(
+                title="Subtitle Mode",
+                prompt="A narrated trailer about a wandering cat.",
+                target_duration_seconds=12,
+                provider="mock",
+                scene_count=3,
+                workflow_mode="hitl",
+                subtitle_mode="enabled",
+            )
+
+            self.assertEqual(project.subtitle_mode, "enabled")
 
     def test_create_project_persists_scene1_first_frame_choice(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -172,10 +191,55 @@ class WorkflowServiceTestCase(unittest.TestCase):
             self.assertEqual(first_scene.first_frame_origin, "generated")
             self.assertEqual(first_scene.first_frame_status, "ready")
             self.assertTrue(first_scene.first_frame_analysis)
-            self.assertEqual(
+            self.assertIn("Opening still brief:", first_scene.first_frame_prompt)
+            self.assertIn(
+                "A vertical portrait still of the heroine holding flowers indoors",
                 first_scene.first_frame_prompt,
-                "A vertical portrait still of the heroine holding flowers indoors.",
             )
+            self.assertIn("earliest stable state", first_scene.first_frame_prompt)
+
+    def test_optimize_prompt_wraps_scene1_auto_generated_first_frame_as_opening_state(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Opening Still Guardrails",
+                prompt="生成一个狮子被关在动物园，虽然每天被投喂食物，但是它过得并不开心，它期望的是草原，鹏鹏和丁满帮助它逃出动物园，回到草原。",
+                target_duration_seconds=12,
+                provider="mock",
+                workflow_mode="hitl",
+                scene1_first_frame_source="auto_generate",
+            )
+
+            optimized = service.optimize_prompt(project.project_id)
+
+            self.assertIn("开场起点图说明：", optimized.scene1_first_frame_prompt)
+            self.assertIn("只生成第1场在 t=0 时刻的单张起点图", optimized.scene1_first_frame_prompt)
+            self.assertIn("不要把后续时间线", optimized.scene1_first_frame_prompt)
+
+    def test_plan_scenes_rebuilds_scene1_auto_generated_first_frame_after_project_level_context(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Scene 1 Still Rebuild",
+                prompt="Han Li studies a hand-drawn map in silence while Granny Liu waits outside with a lantern.",
+                target_duration_seconds=12,
+                provider="mock",
+                workflow_mode="hitl",
+                scene_count=2,
+                scene1_first_frame_source="auto_generate",
+            )
+
+            optimized = service.optimize_prompt(project.project_id)
+            initial_prompt = optimized.scene1_first_frame_prompt
+
+            planned = service.plan_scenes(project.project_id)
+            first_scene = next(scene for scene in planned.scenes if scene.scene_id == "scene-01")
+
+            self.assertNotEqual(first_scene.first_frame_prompt, initial_prompt)
+            self.assertIn("Opening still brief:", first_scene.first_frame_prompt)
+            self.assertIn("Han Li", first_scene.first_frame_prompt)
 
     def test_start_scene_generation_rejects_legacy_unsupported_scene_duration(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -223,6 +287,86 @@ class WorkflowServiceTestCase(unittest.TestCase):
             self.assertNotIn("Granny Liu", first_scene.first_frame_prompt)
             self.assertEqual(planned.scene1_first_frame_prompt, first_scene.first_frame_prompt)
             self.assertTrue(Path(str(first_scene.first_frame_image)).exists())
+
+    def test_revise_scene_prompt_updates_scene_prompt_from_feedback(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Prompt Feedback Revision",
+                prompt="A woman studies an old map by candlelight.",
+                target_duration_seconds=10,
+                provider="mock",
+                workflow_mode="hitl",
+            )
+
+            service.optimize_prompt(project.project_id)
+            planned = service.plan_scenes(project.project_id)
+            previous_prompt = planned.scenes[0].prompt
+
+            revised = service.revise_scene_prompt(
+                planned.project_id,
+                "scene-01",
+                {"feedback": "镜头再近一点，情绪更压抑", "scope": "prompt_only"},
+            )
+
+            first_scene = next(scene for scene in revised.scenes if scene.scene_id == "scene-01")
+            self.assertNotEqual(first_scene.prompt, previous_prompt)
+            self.assertIn("镜头再近一点", first_scene.prompt)
+            self.assertEqual(first_scene.approved_prompt, "")
+
+    def test_revise_scene_prompt_can_regenerate_scene1_opening_still(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Opening Still Feedback Revision",
+                prompt="生成一个狮子被关在动物园，虽然每天被投喂食物，但是它过得并不开心，它期望的是草原，鹏鹏和丁满帮助它逃出动物园，回到草原。",
+                target_duration_seconds=12,
+                provider="mock",
+                workflow_mode="hitl",
+                scene1_first_frame_source="auto_generate",
+            )
+
+            service.optimize_prompt(project.project_id)
+            planned = service.plan_scenes(project.project_id)
+            first_scene_before = next(scene for scene in planned.scenes if scene.scene_id == "scene-01")
+            previous_first_frame_prompt = first_scene_before.first_frame_prompt
+
+            revised = service.revise_scene_prompt(
+                planned.project_id,
+                "scene-01",
+                {"feedback": "门不应该开着", "scope": "opening_still_and_prompt"},
+            )
+
+            first_scene_after = next(scene for scene in revised.scenes if scene.scene_id == "scene-01")
+            self.assertNotEqual(first_scene_after.first_frame_prompt, previous_first_frame_prompt)
+            self.assertIn("门不应该开着", first_scene_after.first_frame_prompt)
+            self.assertIn("门不应该开着", first_scene_after.prompt)
+            self.assertTrue(Path(str(first_scene_after.first_frame_image)).exists())
+
+    def test_revise_scene_prompt_rejects_continuity_start_state_change(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Continuity Prompt Feedback",
+                prompt="A lion waits behind zoo bars, then later crosses into open grassland.",
+                target_duration_seconds=12,
+                provider="mock",
+                workflow_mode="hitl",
+                scene_count=2,
+            )
+
+            service.optimize_prompt(project.project_id)
+            planned = service.plan_scenes(project.project_id)
+
+            with self.assertRaisesRegex(ValueError, "起始状态|start state"):
+                service.revise_scene_prompt(
+                    planned.project_id,
+                    "scene-02",
+                    {"feedback": "门不应该开着", "scope": "prompt_only"},
+                )
 
     def test_prepare_character_anchors_generates_project_level_text_cards(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -296,6 +440,465 @@ class WorkflowServiceTestCase(unittest.TestCase):
             first_card = serialized["character_cards"][0]
             self.assertTrue(first_card["reference_image"])
             self.assertTrue(first_card["reference_image_url"].startswith("http://127.0.0.1:8787/artifacts/"))
+
+    def test_serialize_project_reports_subtitle_state_from_local_eligibility(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Eligibility",
+                prompt="A short narrated trailer about a lion returning home.",
+                target_duration_seconds=12,
+                provider="mock",
+                workflow_mode="hitl",
+                subtitle_mode="enabled",
+            )
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Opening",
+                    duration_seconds=6,
+                    narrative="Silent setup",
+                    spoken_text="",
+                    speech_mode="none",
+                ),
+                Scene(
+                    scene_id="scene-02",
+                    index=2,
+                    title="Reveal",
+                    duration_seconds=6,
+                    narrative="Spoken reveal",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                ),
+            ]
+
+            serialized = service.serialize_project(project, base_url="http://127.0.0.1:8787")
+
+            self.assertEqual(serialized["subtitle_mode"], "enabled")
+            self.assertTrue(serialized["subtitle"]["enabled"])
+            self.assertTrue(serialized["subtitle"]["eligible"])
+            self.assertEqual(serialized["subtitle"]["status"], "planned")
+            self.assertEqual(serialized["subtitle"]["reason"], "eligible")
+
+    def test_compose_video_generates_subtitle_sidecars_without_blocking_delivery(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Compose",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            clip_rel_path = f"{project.project_id}/scenes/scene-01.mp4"
+            clip_path = settings.artifact_dir / clip_rel_path
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_bytes(b"scene-clip")
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Return",
+                    duration_seconds=8,
+                    narrative="A voiced return home.",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                    status="generated",
+                    video_rel_path=clip_rel_path,
+                )
+            ]
+            service.repo.save(project)
+
+            class FakeSubtitleClient:
+                name = "fake_subtitles"
+
+                def align_known_text(self, *, audio_path: Path, subtitle_text: str, language: str | None = None):
+                    self.last_audio_path = audio_path
+                    self.last_text = subtitle_text
+                    self.last_language = language
+                    return SubtitleAlignmentResult(
+                        provider=self.name,
+                        alignment_strategy="text_alignment",
+                        cues=[
+                            SubtitleCue(start_time_ms=0, end_time_ms=1200, text="他终于看见了真正的草原。"),
+                        ],
+                        metadata={"task_id": "task_sub_001"},
+                    )
+
+            subtitle_client = FakeSubtitleClient()
+
+            def fake_compose_clips(**kwargs):
+                output_path = kwargs["output_path"]
+                output_path.write_bytes(b"final-video")
+                return {"mode": "concat", "clip_count": 1}
+
+            def fake_extract_audio_track(**kwargs):
+                kwargs["output_path"].write_bytes(b"wav")
+
+            with patch(
+                "video_workflow_service.application.workflow_service.compose_clips",
+                side_effect=fake_compose_clips,
+            ), patch.object(
+                service,
+                "_subtitle_service_is_configured",
+                return_value=True,
+            ), patch.object(
+                service,
+                "_build_subtitle_client",
+                return_value=subtitle_client,
+            ), patch(
+                "video_workflow_service.application.workflow_service.extract_audio_track",
+                side_effect=fake_extract_audio_track,
+            ):
+                composed = service.compose_video(project.project_id)
+                self.assertEqual(composed.status, "delivered")
+                completed = service.wait_for_subtitle_job(project.project_id, timeout_seconds=5.0)
+
+            self.assertIsNotNone(completed.subtitle_job)
+            self.assertEqual(completed.subtitle_job.status, "completed")
+            self.assertTrue(completed.subtitle_srt_rel_path)
+            self.assertTrue(completed.subtitle_vtt_rel_path)
+            self.assertTrue((settings.artifact_dir / str(completed.subtitle_srt_rel_path)).exists())
+            self.assertTrue((settings.artifact_dir / str(completed.subtitle_vtt_rel_path)).exists())
+            self.assertEqual(subtitle_client.last_text, "他终于看见了真正的草原。")
+            serialized = service.serialize_project(completed, base_url="http://127.0.0.1:8787")
+            self.assertEqual(serialized["subtitle"]["status"], "completed")
+            self.assertEqual(serialized["subtitle"]["provider"], "fake_subtitles")
+            self.assertTrue(serialized["subtitle"]["package_url"].endswith(f"/projects/{project.project_id}/delivery-package"))
+
+            package_path = service.build_delivery_package(project.project_id)
+            self.assertTrue(package_path.exists())
+            with zipfile.ZipFile(package_path, "r") as archive:
+                self.assertEqual(sorted(archive.namelist()), ["final.mp4", "final.srt", "final.vtt"])
+
+    def test_apply_subtitle_alignment_result_creates_delivery_directory_when_missing(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Publish Directory",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            project.final_video_rel_path = f"{project.project_id}/delivery/final.mp4"
+            project.subtitle_job = SubtitleJob(
+                job_id="stj_test",
+                status="running",
+                provider="fake_subtitles",
+                mode="enabled",
+            )
+            service.repo.save(project)
+
+            completed = service._apply_subtitle_alignment_result(
+                project.project_id,
+                "stj_test",
+                SubtitleAlignmentResult(
+                    provider="fake_subtitles",
+                    alignment_strategy="text_alignment",
+                    cues=[SubtitleCue(start_time_ms=0, end_time_ms=800, text="回家了。")],
+                    metadata={"task_id": "task_sub_001"},
+                ),
+            )
+
+            self.assertTrue((settings.artifact_dir / str(completed.subtitle_srt_rel_path)).exists())
+            self.assertTrue((settings.artifact_dir / str(completed.subtitle_vtt_rel_path)).exists())
+
+    def test_compose_video_keeps_delivery_successful_when_subtitle_sidecar_fails(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Failure Isolation",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            clip_rel_path = f"{project.project_id}/scenes/scene-01.mp4"
+            clip_path = settings.artifact_dir / clip_rel_path
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_bytes(b"scene-clip")
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Return",
+                    duration_seconds=8,
+                    narrative="A voiced return home.",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                    status="generated",
+                    video_rel_path=clip_rel_path,
+                )
+            ]
+            service.repo.save(project)
+
+            class FailingSubtitleClient:
+                name = "fake_subtitles"
+
+                def align_known_text(self, *, audio_path: Path, subtitle_text: str, language: str | None = None):
+                    raise RuntimeError("subtitle alignment unavailable")
+
+            def fake_compose_clips(**kwargs):
+                kwargs["output_path"].write_bytes(b"final-video")
+                return {"mode": "concat", "clip_count": 1}
+
+            def fake_extract_audio_track(**kwargs):
+                kwargs["output_path"].write_bytes(b"wav")
+
+            with patch(
+                "video_workflow_service.application.workflow_service.compose_clips",
+                side_effect=fake_compose_clips,
+            ), patch.object(
+                service,
+                "_subtitle_service_is_configured",
+                return_value=True,
+            ), patch.object(
+                service,
+                "_build_subtitle_client",
+                return_value=FailingSubtitleClient(),
+            ), patch.object(
+                service,
+                "_subtitle_asr_fallback_is_configured",
+                return_value=False,
+            ), patch(
+                "video_workflow_service.application.workflow_service.extract_audio_track",
+                side_effect=fake_extract_audio_track,
+            ):
+                composed = service.compose_video(project.project_id)
+                self.assertEqual(composed.status, "delivered")
+                completed = service.wait_for_subtitle_job(project.project_id, timeout_seconds=5.0)
+
+            self.assertEqual(completed.status, "delivered")
+            self.assertIsNotNone(completed.subtitle_job)
+            self.assertEqual(completed.subtitle_job.status, "failed")
+            self.assertIn("subtitle alignment unavailable", str(completed.subtitle_job.error_message))
+
+    def test_compose_video_falls_back_to_asr_when_text_alignment_fails(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle ASR Fallback",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            clip_rel_path = f"{project.project_id}/scenes/scene-01.mp4"
+            clip_path = settings.artifact_dir / clip_rel_path
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_bytes(b"scene-clip")
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Return",
+                    duration_seconds=8,
+                    narrative="A voiced return home.",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                    status="generated",
+                    video_rel_path=clip_rel_path,
+                )
+            ]
+            service.repo.save(project)
+
+            class FailingSubtitleClient:
+                name = "fake_ata"
+
+                def align_known_text(self, *, audio_path: Path, subtitle_text: str, language: str | None = None):
+                    raise RuntimeError("ata alignment unavailable")
+
+            class FakeAsrClient:
+                name = "fake_asr"
+
+                def recognize_audio(self, *, audio_path: Path, language: str | None = None):
+                    self.last_audio_path = audio_path
+                    self.last_language = language
+                    return SubtitleAlignmentResult(
+                        provider=self.name,
+                        alignment_strategy="asr_recognition",
+                        cues=[
+                            SubtitleCue(start_time_ms=0, end_time_ms=1200, text="他终于看见了真正的草原。"),
+                        ],
+                        metadata={"task_id": "task_asr_001"},
+                    )
+
+            asr_client = FakeAsrClient()
+
+            def fake_compose_clips(**kwargs):
+                kwargs["output_path"].write_bytes(b"final-video")
+                return {"mode": "concat", "clip_count": 1}
+
+            def fake_extract_audio_track(**kwargs):
+                kwargs["output_path"].write_bytes(b"wav")
+
+            with patch(
+                "video_workflow_service.application.workflow_service.compose_clips",
+                side_effect=fake_compose_clips,
+            ), patch.object(
+                service,
+                "_subtitle_service_is_configured",
+                return_value=True,
+            ), patch.object(
+                service,
+                "_build_subtitle_client",
+                return_value=FailingSubtitleClient(),
+            ), patch.object(
+                service,
+                "_build_subtitle_asr_client",
+                return_value=asr_client,
+            ), patch(
+                "video_workflow_service.application.workflow_service.extract_audio_track",
+                side_effect=fake_extract_audio_track,
+            ):
+                composed = service.compose_video(project.project_id)
+                self.assertEqual(composed.status, "delivered")
+                completed = service.wait_for_subtitle_job(project.project_id, timeout_seconds=5.0)
+
+            self.assertIsNotNone(completed.subtitle_job)
+            self.assertEqual(completed.subtitle_job.status, "completed")
+            self.assertEqual(completed.subtitle_job.provider, "fake_asr")
+            self.assertEqual(completed.subtitle_job.metadata["alignment_strategy"], "asr_recognition")
+            self.assertEqual(completed.subtitle_job.metadata["fallback_from"], "text_alignment")
+            self.assertEqual(asr_client.last_audio_path.name, "final.subtitle-input.wav")
+            self.assertEqual(asr_client.last_language, "")
+
+    def test_compose_video_skips_subtitle_sidecar_when_service_is_not_configured(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Skip",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            clip_rel_path = f"{project.project_id}/scenes/scene-01.mp4"
+            clip_path = settings.artifact_dir / clip_rel_path
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_bytes(b"scene-clip")
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Return",
+                    duration_seconds=8,
+                    narrative="A voiced return home.",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                    status="generated",
+                    video_rel_path=clip_rel_path,
+                )
+            ]
+            service.repo.save(project)
+
+            def fake_compose_clips(**kwargs):
+                kwargs["output_path"].write_bytes(b"final-video")
+                return {"mode": "concat", "clip_count": 1}
+
+            with patch(
+                "video_workflow_service.application.workflow_service.compose_clips",
+                side_effect=fake_compose_clips,
+            ):
+                composed = service.compose_video(project.project_id)
+
+            self.assertEqual(composed.status, "delivered")
+            self.assertIsNotNone(composed.subtitle_job)
+            self.assertEqual(composed.subtitle_job.status, "skipped")
+            serialized = service.serialize_project(composed, base_url="http://127.0.0.1:8787")
+            self.assertEqual(serialized["subtitle"]["status"], "skipped")
+
+    def test_export_subtitled_video_publishes_separate_burned_artifact(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="Subtitle Burn Export",
+                prompt="A narrated trailer about a lion returning home.",
+                target_duration_seconds=8,
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            clip_rel_path = f"{project.project_id}/scenes/scene-01.mp4"
+            clip_path = settings.artifact_dir / clip_rel_path
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            clip_path.write_bytes(b"scene-clip")
+            project.scenes = [
+                Scene(
+                    scene_id="scene-01",
+                    index=1,
+                    title="Return",
+                    duration_seconds=8,
+                    narrative="A voiced return home.",
+                    spoken_text="他终于看见了真正的草原。",
+                    speech_mode="once",
+                    status="generated",
+                    video_rel_path=clip_rel_path,
+                )
+            ]
+            service.repo.save(project)
+
+            class FakeSubtitleClient:
+                name = "fake_subtitles"
+
+                def align_known_text(self, *, audio_path: Path, subtitle_text: str, language: str | None = None):
+                    return SubtitleAlignmentResult(
+                        provider=self.name,
+                        alignment_strategy="text_alignment",
+                        cues=[SubtitleCue(start_time_ms=0, end_time_ms=1200, text="他终于看见了真正的草原。")],
+                        metadata={"task_id": "task_sub_001"},
+                    )
+
+            def fake_compose_clips(**kwargs):
+                kwargs["output_path"].write_bytes(b"final-video")
+                return {"mode": "concat", "clip_count": 1}
+
+            def fake_extract_audio_track(**kwargs):
+                kwargs["output_path"].write_bytes(b"wav")
+
+            def fake_burn_subtitles_into_video(**kwargs):
+                kwargs["output_path"].write_bytes(b"burned-video")
+
+            with patch(
+                "video_workflow_service.application.workflow_service.compose_clips",
+                side_effect=fake_compose_clips,
+            ), patch.object(
+                service,
+                "_subtitle_service_is_configured",
+                return_value=True,
+            ), patch.object(
+                service,
+                "_build_subtitle_client",
+                return_value=FakeSubtitleClient(),
+            ), patch(
+                "video_workflow_service.application.workflow_service.extract_audio_track",
+                side_effect=fake_extract_audio_track,
+            ), patch(
+                "video_workflow_service.application.workflow_service.burn_subtitles_into_video",
+                side_effect=fake_burn_subtitles_into_video,
+            ):
+                service.compose_video(project.project_id)
+                service.wait_for_subtitle_job(project.project_id, timeout_seconds=5.0)
+                queued = service.export_subtitled_video(project.project_id)
+                self.assertIsNotNone(queued.subtitle_burn_job)
+                self.assertEqual(queued.subtitle_burn_job.status, "queued")
+                completed = service.wait_for_subtitle_burn_job(project.project_id, timeout_seconds=5.0)
+
+            self.assertIsNotNone(completed.subtitle_burn_job)
+            self.assertEqual(completed.subtitle_burn_job.status, "completed")
+            self.assertTrue(completed.subtitle_burned_video_rel_path)
+            self.assertTrue((settings.artifact_dir / str(completed.subtitle_burned_video_rel_path)).exists())
+            serialized = service.serialize_project(completed, base_url="http://127.0.0.1:8787")
+            self.assertEqual(serialized["subtitle"]["burn_status"], "completed")
+            self.assertTrue(str(serialized["subtitle"]["burned_video_url"]).endswith("/final_burned.mp4"))
 
     def test_plan_scenes_records_story_roles_and_story_plan_event(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -707,7 +1310,12 @@ class WorkflowServiceTestCase(unittest.TestCase):
             self.assertEqual(updated.scenes[0].status, "pending_review")
 
             service.start_scene_generation(project.project_id, "scene-01")
-            regenerated = self._wait_for_scene_status(service, project.project_id, "scene-01", "pending_review")
+            regenerated = self._wait_for_scene_video_job_attempt(
+                service,
+                project.project_id,
+                "scene-01",
+                minimum_attempt_count=original_job.attempt_count + 1,
+            )
             scene = regenerated.scenes[0]
             self.assertIsNotNone(scene.video_job)
             self.assertGreater(scene.video_job.attempt_count, original_job.attempt_count)
@@ -1102,6 +1710,31 @@ class WorkflowServiceTestCase(unittest.TestCase):
                     return project
             time.sleep(poll_interval_seconds)
         raise TimeoutError(f"Scene {scene_id} did not become prompt-stale")
+
+    def _wait_for_scene_video_job_attempt(
+        self,
+        service: WorkflowService,
+        project_id: str,
+        scene_id: str,
+        *,
+        minimum_attempt_count: int,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = 0.1,
+    ):
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            project = service.get_project(project_id)
+            for scene in project.scenes:
+                video_job = scene.video_job
+                if (
+                    scene.scene_id == scene_id
+                    and video_job is not None
+                    and video_job.attempt_count >= minimum_attempt_count
+                    and scene.status == "pending_review"
+                ):
+                    return project
+            time.sleep(poll_interval_seconds)
+        raise TimeoutError(f"Scene {scene_id} did not reach attempt_count {minimum_attempt_count}")
 
 
 if __name__ == "__main__":

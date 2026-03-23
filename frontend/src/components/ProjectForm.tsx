@@ -1,4 +1,5 @@
 import type { ProviderDescriptor } from "../api/client";
+import { useI18n } from "../i18n/provider";
 import type { ProjectFormState } from "../state/project-store";
 
 interface ProjectFormProps {
@@ -22,47 +23,48 @@ export function ProjectForm({
   onScene1FirstFrameFileChange,
   onSubmit
 }: ProjectFormProps) {
+  const { messages } = useI18n();
   const selectedProvider = providers.find((provider) => provider.name === form.provider);
   const supportsContinuity = Boolean(selectedProvider?.capabilities["supports_first_last_frame"]);
   const resolution = selectedProvider?.capabilities["resolution"];
   const submitLabel = validationMessage
-    ? "Adjust Duration or Scene Count"
+    ? messages.projectForm.submitAdjust
     : disabled
-      ? "Creating..."
-      : "Create Project";
+      ? messages.projectForm.submitCreating
+      : messages.projectForm.submitCreate;
 
   return (
     <section className="panel panel-form">
       <div className="panel-header">
         <div>
-          <p className="eyebrow">Project Setup</p>
-          <h2>Create Project</h2>
+          <p className="eyebrow">{messages.projectForm.eyebrow}</p>
+          <h2>{messages.projectForm.title}</h2>
         </div>
-        <span className="panel-badge">Start Here</span>
+        <span className="panel-badge">{messages.projectForm.badge}</span>
       </div>
 
       <label className="field">
-        <span>Title</span>
+        <span>{messages.projectForm.titleLabel}</span>
         <input
           value={form.title}
           onChange={(event) => onFieldChange("title", event.target.value)}
-          placeholder="Campaign title"
+          placeholder={messages.projectForm.titlePlaceholder}
         />
       </label>
 
       <label className="field">
-        <span>Prompt</span>
+        <span>{messages.projectForm.promptLabel}</span>
         <textarea
           rows={6}
           value={form.prompt}
           onChange={(event) => onFieldChange("prompt", event.target.value)}
-          placeholder="Describe the short video goal, tone, and product story."
+          placeholder={messages.projectForm.promptPlaceholder}
         />
       </label>
 
       <div className="field-grid">
         <label className="field">
-          <span>Target Duration</span>
+          <span>{messages.projectForm.targetDurationLabel}</span>
           <input
             type="number"
             min={5}
@@ -72,7 +74,7 @@ export function ProjectForm({
         </label>
 
         <label className="field">
-          <span>Scene Count</span>
+          <span>{messages.projectForm.sceneCountLabel}</span>
           <input
             type="number"
             min={1}
@@ -83,7 +85,7 @@ export function ProjectForm({
       </div>
 
       <label className="field">
-        <span>Provider</span>
+        <span>{messages.projectForm.providerLabel}</span>
         <select
           value={form.provider}
           onChange={(event) => onFieldChange("provider", event.target.value)}
@@ -98,33 +100,44 @@ export function ProjectForm({
       </label>
 
       <label className="field">
-        <span>Workflow Mode</span>
+        <span>{messages.projectForm.workflowModeLabel}</span>
         <select
           value={form.workflowMode}
           onChange={(event) => onFieldChange("workflowMode", event.target.value)}
         >
-          <option value="hitl">HITL scene review</option>
-          <option value="auto">Auto workflow</option>
+          <option value="hitl">{messages.projectForm.workflowModeHitl}</option>
+          <option value="auto">{messages.projectForm.workflowModeAuto}</option>
+        </select>
+      </label>
+
+      <label className="field">
+        <span>{messages.projectForm.subtitleModeLabel}</span>
+        <select
+          value={form.subtitleMode}
+          onChange={(event) => onFieldChange("subtitleMode", event.target.value)}
+        >
+          <option value="disabled">{messages.projectForm.subtitleModeDisabled}</option>
+          <option value="enabled">{messages.projectForm.subtitleModeEnabled}</option>
         </select>
       </label>
 
       <div className="field-group">
-        <p className="field-group-title">Scene 1 First Frame</p>
+        <p className="field-group-title">{messages.projectForm.firstFrameSectionTitle}</p>
         <label className="field">
-          <span>Opening Frame Source</span>
+          <span>{messages.projectForm.openingFrameSourceLabel}</span>
           <select
             value={form.scene1FirstFrameSource}
             onChange={(event) => onFieldChange("scene1FirstFrameSource", event.target.value)}
           >
-            <option value="auto_generate">Auto generate still</option>
-            <option value="upload">Upload still</option>
+            <option value="auto_generate">{messages.projectForm.autoGenerateStill}</option>
+            <option value="upload">{messages.projectForm.uploadStill}</option>
           </select>
         </label>
 
         {form.scene1FirstFrameSource === "upload" ? (
           <>
             <label className="field">
-              <span>Upload First Frame</span>
+              <span>{messages.projectForm.uploadFirstFrameLabel}</span>
               <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
@@ -132,46 +145,52 @@ export function ProjectForm({
               />
             </label>
             <div className="provider-summary">
-              <span className="eyebrow">Opening Still</span>
+              <span className="eyebrow">{messages.projectForm.openingStillEyebrow}</span>
               <p>
                 {form.scene1FirstFrameFileName
-                  ? `Selected file: ${form.scene1FirstFrameFileName}`
-                  : "Upload the still that scene 1 should open from."}
+                  ? messages.projectForm.selectedFile(form.scene1FirstFrameFileName)
+                  : messages.projectForm.uploadStillHelp}
               </p>
             </div>
             {form.scene1FirstFrameImage ? (
               <img
                 className="scene-frame scene-first-frame-preview"
                 src={form.scene1FirstFrameImage}
-                alt="Scene 1 uploaded first-frame preview"
+                alt={messages.projectForm.uploadedPreviewAlt}
               />
             ) : null}
           </>
         ) : (
           <div className="provider-summary">
-            <span className="eyebrow">Opening Still</span>
-            <p>
-              The workflow will derive and generate the opening still for scene 1 after planning. You only need
-              to choose whether scene 1 starts from an uploaded still or an auto-generated still.
-            </p>
+            <span className="eyebrow">{messages.projectForm.openingStillEyebrow}</span>
+            <p>{messages.projectForm.autoStillHelp}</p>
           </div>
         )}
       </div>
 
       <div className="provider-summary">
-        <span className="eyebrow">What This Setup Supports</span>
+        <span className="eyebrow">{messages.projectForm.capabilityEyebrow}</span>
         <p>
           {selectedProvider
-            ? `Resolution ${String(resolution ?? "n/a")} with ${
-                supportsContinuity ? "frame continuity" : "basic scene generation"
-              }. ${form.workflowMode === "hitl" ? "This project will pause for scene approval." : "This project will run end-to-end automatically."}`
-            : "Available settings will appear after loading."}
+            ? messages.projectForm.capabilitySummary(
+                typeof resolution === "string" && resolution.trim() ? resolution : null,
+                supportsContinuity,
+                form.workflowMode === "hitl"
+              )
+            : messages.projectForm.capabilityUnavailable}
         </p>
       </div>
 
+      {form.subtitleMode !== "disabled" ? (
+        <div className="provider-summary">
+          <span className="eyebrow">{messages.projectForm.subtitleEyebrow}</span>
+          <p>{messages.projectForm.subtitleHelp}</p>
+        </div>
+      ) : null}
+
       {validationMessage ? (
         <div className="provider-summary">
-          <span className="eyebrow">Duration Check</span>
+          <span className="eyebrow">{messages.projectForm.durationCheckEyebrow}</span>
           <p>{validationMessage}</p>
         </div>
       ) : null}

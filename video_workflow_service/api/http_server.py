@@ -15,6 +15,8 @@ from video_workflow_service.infrastructure.config import ServiceSettings, load_s
 
 
 logger = logging.getLogger(__name__)
+mimetypes.add_type("application/x-subrip", ".srt")
+mimetypes.add_type("text/vtt", ".vtt")
 
 
 class WorkflowRequestHandler(BaseHTTPRequestHandler):
@@ -25,6 +27,7 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        query = urllib.parse.parse_qs(parsed.query)
 
         if path in {"/", "/index.html"}:
             self._serve_frontend_entry()
@@ -43,7 +46,10 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
             self._json_response(payload)
             return
         if path.startswith("/artifacts/"):
-            self._serve_artifact(path.removeprefix("/artifacts/"))
+            self._serve_artifact(
+                path.removeprefix("/artifacts/"),
+                download=self._query_flag(query, "download"),
+            )
             return
 
         match = re.fullmatch(r"/projects/([^/]+)", path)
@@ -63,6 +69,18 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
                     "project": payload,
                 }
             )
+            return
+        match = re.fullmatch(r"/projects/([^/]+)/delivery-package", path)
+        if match:
+            try:
+                package_path = self.service.build_delivery_package(match.group(1))
+            except KeyError as exc:
+                self._json_error(HTTPStatus.NOT_FOUND, str(exc))
+                return
+            except Exception as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._serve_file(package_path, as_attachment=True)
             return
         if self._should_serve_frontend_asset(path):
             self._serve_frontend_asset(path)
@@ -87,6 +105,7 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
                     provider=body.get("provider"),
                     scene_count=body.get("scene_count"),
                     workflow_mode=body.get("workflow_mode"),
+                    subtitle_mode=body.get("subtitle_mode"),
                     scene1_first_frame_source=body.get("scene1_first_frame_source"),
                     scene1_first_frame_image=body.get("scene1_first_frame_image"),
                     scene1_first_frame_prompt=body.get("scene1_first_frame_prompt"),
@@ -102,10 +121,12 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
                 (r"/projects/([^/]+)/storyboards/upload", self._handle_storyboard_upload),
                 (r"/projects/([^/]+)/generate-scenes", self._handle_generate_scenes),
                 (r"/projects/([^/]+)/compose", self._handle_compose),
+                (r"/projects/([^/]+)/export-subtitled-video", self._handle_export_subtitled_video),
                 (r"/projects/([^/]+)/workflow/run", self._handle_workflow_run),
                 (r"/projects/([^/]+)/workflow/start", self._handle_workflow_start),
                 (r"/projects/([^/]+)/scenes/([^/]+)/generate", self._handle_scene_generate),
                 (r"/projects/([^/]+)/scenes/([^/]+)/approve", self._handle_scene_approve),
+                (r"/projects/([^/]+)/scenes/([^/]+)/revise", self._handle_scene_prompt_revise),
                 (r"/projects/([^/]+)/characters/([^/]+)/generate-reference", self._handle_character_generate_reference),
                 (r"/projects/([^/]+)/characters/([^/]+)/upload-reference", self._handle_character_upload_reference),
                 (r"/projects/([^/]+)/characters/([^/]+)/approve", self._handle_character_approve),
@@ -176,6 +197,10 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
         project = self.service.compose_video(project_id)
         return self.service.serialize_project(project, base_url=self._base_url()), HTTPStatus.OK
 
+    def _handle_export_subtitled_video(self, project_id: str, _: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
+        project = self.service.export_subtitled_video(project_id)
+        return self.service.serialize_project(project, base_url=self._base_url()), HTTPStatus.ACCEPTED
+
     def _handle_workflow_run(self, project_id: str, _: dict[str, Any]) -> tuple[dict[str, Any], HTTPStatus]:
         project = self.service.run_workflow(project_id)
         return self.service.serialize_project(project, base_url=self._base_url()), HTTPStatus.OK
@@ -200,6 +225,15 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
         _: dict[str, Any],
     ) -> tuple[dict[str, Any], HTTPStatus]:
         project = self.service.approve_scene(project_id, scene_id)
+        return self.service.serialize_project(project, base_url=self._base_url()), HTTPStatus.OK
+
+    def _handle_scene_prompt_revise(
+        self,
+        project_id: str,
+        scene_id: str,
+        body: dict[str, Any],
+    ) -> tuple[dict[str, Any], HTTPStatus]:
+        project = self.service.revise_scene_prompt(project_id, scene_id, body)
         return self.service.serialize_project(project, base_url=self._base_url()), HTTPStatus.OK
 
     def _handle_character_generate_reference(
@@ -268,7 +302,7 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
     def _json_error(self, status: HTTPStatus, message: str) -> None:
         self._json_response({"error": message, "status": int(status)}, status=status)
 
-    def _serve_artifact(self, rel_path: str) -> None:
+    def _serve_artifact(self, rel_path: str, *, download: bool = False) -> None:
         candidate = (self.settings.artifact_dir / rel_path).resolve()
         artifact_root = self.settings.artifact_dir.resolve()
         if artifact_root not in candidate.parents and candidate != artifact_root:
@@ -277,7 +311,7 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
         if not candidate.exists() or not candidate.is_file():
             self._json_error(HTTPStatus.NOT_FOUND, "Artifact not found")
             return
-        self._serve_file(candidate)
+        self._serve_file(candidate, as_attachment=download)
 
     def _serve_frontend_entry(self) -> None:
         index_path = self.settings.frontend_dist_dir / "index.html"
@@ -297,15 +331,24 @@ class WorkflowRequestHandler(BaseHTTPRequestHandler):
             return
         self._serve_file(candidate)
 
-    def _serve_file(self, path: Path) -> None:
+    def _serve_file(self, path: Path, *, as_attachment: bool = False, download_name: str | None = None) -> None:
         mime_type, _ = mimetypes.guess_type(str(path))
         content_type = mime_type or "application/octet-stream"
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if as_attachment:
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name or path.name}"')
         self.end_headers()
         self._safe_write(body)
+
+    def _query_flag(self, query: dict[str, list[str]], key: str) -> bool:
+        values = query.get(key, [])
+        if not values:
+            return False
+        value = str(values[-1]).strip().lower()
+        return value in {"1", "true", "yes", "on", ""}
 
     def _should_serve_frontend_asset(self, path: str) -> bool:
         if path.startswith("/assets/"):

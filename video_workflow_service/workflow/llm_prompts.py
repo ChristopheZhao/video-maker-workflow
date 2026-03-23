@@ -12,6 +12,7 @@ SCENE_PLAN_TEMPLATE_VERSION = "scene_plan.v1"
 DIALOGUE_ALLOCATE_TEMPLATE_VERSION = "dialogue_allocate.v1"
 FIRST_FRAME_ANALYZE_TEMPLATE_VERSION = "first_frame_analyze.v1"
 SCENE_PROMPT_RENDER_TEMPLATE_VERSION = "scene_prompt_render.v1"
+SCENE_PROMPT_REVISE_TEMPLATE_VERSION = "scene_prompt_revise.v1"
 
 
 def build_character_anchor_messages(input_payload: dict[str, Any]) -> tuple[str, str]:
@@ -340,6 +341,41 @@ def build_scene_prompt_render_messages(input_payload: dict[str, Any]) -> tuple[s
         "- Prefer one or two high-signal carry-over anchors over a long inventory of repeated details.\n"
         "- Do not mention uploaded/provided/generated first frames explicitly in the final prompt.\n"
         "Structured scene input:\n"
+        f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
+    )
+    return system_prompt, user_prompt
+
+
+def build_scene_prompt_revise_messages(input_payload: dict[str, Any]) -> tuple[str, str]:
+    system_prompt = (
+        "You revise scene-generation prompts from short human feedback inside a HITL video workflow. "
+        "Return only valid JSON. "
+        "Do not generate workflow commentary. "
+        "If requested_scope is prompt_only, revise only the scene prompt draft while preserving the current opening-state truth and any supplied first-frame facts. "
+        "If the feedback cannot be satisfied without changing the starting-state truth, return outcome=requires_start_state_edit instead of silently changing the prompt. "
+        "If requested_scope is opening_still_and_prompt, use it only for scene-01 style opening-state correction and return a revised opening-still prompt that stays at t=0. "
+        "Preserve spoken_text exactly when it already exists. "
+        "If input_language is zh, write revised prompt text naturally in Chinese. "
+        "If input_language is en, write revised prompt text naturally in English."
+    )
+    user_prompt = (
+        "Revise the scene prompt from the following structured input.\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "outcome": "revised" | "requires_start_state_edit",\n'
+        '  "revised_prompt": string,\n'
+        '  "revised_first_frame_prompt": string,\n'
+        '  "change_summary": string,\n'
+        '  "rejection_reason": string\n'
+        "}\n\n"
+        "Rules:\n"
+        "- If outcome is revised and requested_scope is prompt_only, revised_prompt must be non-empty.\n"
+        "- If outcome is revised and requested_scope is opening_still_and_prompt, revised_first_frame_prompt must be non-empty.\n"
+        "- Use revised_first_frame_prompt only when requested_scope is opening_still_and_prompt.\n"
+        "- Do not change the scene start-state truth in prompt_only mode.\n"
+        "- If the feedback is really asking to change inherited continuity start-state truth, set outcome=requires_start_state_edit and explain why in rejection_reason.\n"
+        "- change_summary should be brief and concrete.\n\n"
+        "Scene revision input:\n"
         f"{json.dumps(input_payload, ensure_ascii=False, indent=2)}"
     )
     return system_prompt, user_prompt

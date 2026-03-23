@@ -88,6 +88,7 @@ export interface ProjectRecord {
   aspect_ratio: string;
   provider: string;
   workflow_mode: string;
+  subtitle_mode?: string;
   scene_count?: number | null;
   scene1_first_frame_source: string;
   scene1_first_frame_image?: string | null;
@@ -99,6 +100,31 @@ export interface ProjectRecord {
   status: string;
   final_video_rel_path?: string | null;
   final_video_url?: string | null;
+  subtitle_srt_rel_path?: string | null;
+  subtitle_vtt_rel_path?: string | null;
+  subtitle_srt_url?: string | null;
+  subtitle_vtt_url?: string | null;
+  subtitle?: {
+    mode: string;
+    enabled: boolean;
+    eligible: boolean;
+    status: string;
+    reason: string;
+    job_id?: string | null;
+    provider?: string | null;
+    error_message?: string | null;
+    srt_rel_path?: string | null;
+    vtt_rel_path?: string | null;
+    srt_url?: string | null;
+    vtt_url?: string | null;
+    package_url?: string | null;
+    language?: string;
+    burned_video_rel_path?: string | null;
+    burned_video_url?: string | null;
+    burn_status?: string;
+    burn_job_id?: string | null;
+    burn_error_message?: string | null;
+  };
   hitl?: HitlProjectState;
   scenes: SceneRecord[];
   workflow_run_job?: WorkflowRunJob | null;
@@ -118,6 +144,7 @@ export interface CreateProjectPayload {
   provider: string;
   scene_count: number;
   workflow_mode: string;
+  subtitle_mode: string;
   scene1_first_frame_source: string;
   scene1_first_frame_image?: string | null;
   scene1_first_frame_prompt?: string;
@@ -134,6 +161,11 @@ export interface StoryboardScenePayload {
 
 export interface ScenePromptUpdatePayload {
   prompt: string;
+}
+
+export interface ScenePromptRevisionPayload {
+  feedback: string;
+  scope: "prompt_only" | "opening_still_and_prompt";
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -216,6 +248,17 @@ export function updateScenePrompt(
   });
 }
 
+export function reviseScenePrompt(
+  projectId: string,
+  sceneId: string,
+  payload: ScenePromptRevisionPayload
+): Promise<ProjectRecord> {
+  return request<ProjectRecord>(`/projects/${projectId}/scenes/${sceneId}/revise`, {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+}
+
 export function generateCharacterReference(projectId: string, characterId: string): Promise<ProjectRecord> {
   return request<ProjectRecord>(`/projects/${projectId}/characters/${characterId}/generate-reference`, {
     method: "POST",
@@ -243,6 +286,13 @@ export function approveCharacterReference(projectId: string, characterId: string
 
 export function composeProject(projectId: string): Promise<ProjectRecord> {
   return request<ProjectRecord>(`/projects/${projectId}/compose`, {
+    method: "POST",
+    body: "{}"
+  });
+}
+
+export function exportSubtitledVideo(projectId: string): Promise<ProjectRecord> {
+  return request<ProjectRecord>(`/projects/${projectId}/export-subtitled-video`, {
     method: "POST",
     body: "{}"
   });

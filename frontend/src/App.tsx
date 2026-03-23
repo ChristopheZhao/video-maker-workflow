@@ -4,12 +4,14 @@ import {
   approveScene,
   composeProject,
   createProject,
+  exportSubtitledVideo,
   generateCharacterReference,
   generateScene,
   getWorkflowStatus,
   listProviders,
   optimizePrompt,
   planScenes,
+  reviseScenePrompt,
   startWorkflow,
   uploadCharacterReference,
   updateScenePrompt
@@ -20,6 +22,7 @@ import { FinalVideoPanel } from "./components/FinalVideoPanel";
 import { ProjectForm } from "./components/ProjectForm";
 import { SceneList } from "./components/SceneList";
 import { WorkflowStatusCard } from "./components/WorkflowStatusCard";
+import { useI18n } from "./i18n/provider";
 import {
   createInitialState,
   shouldPollProject,
@@ -52,6 +55,7 @@ function parseSceneDurationBounds(capabilities: Record<string, unknown> | undefi
 
 export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, createInitialState);
+  const { locale, setLocale, messages } = useI18n();
 
   useEffect(() => {
     let cancelled = false;
@@ -67,7 +71,7 @@ export default function App() {
         if (!cancelled) {
           dispatch({
             type: "providers/load-failure",
-            message: error instanceof Error ? error.message : "Failed to load providers."
+            message: error instanceof Error ? error.message : messages.app.providerLoadFailed
           });
         }
       }
@@ -99,7 +103,7 @@ export default function App() {
           if (!cancelled) {
             dispatch({
               type: "ui/error",
-              message: error instanceof Error ? error.message : "Failed to refresh workflow status."
+              message: error instanceof Error ? error.message : messages.app.workflowRefreshFailed
             });
           }
         });
@@ -127,16 +131,20 @@ export default function App() {
     if (durations.every((duration) => duration >= minDuration && duration <= maxDuration)) {
       return null;
     }
-    return `This provider cannot split ${targetDurationSeconds}s across ${sceneCount} scenes. The current split would be ${durations.join(
-      "/"
-    )}s, but supported per-scene durations are ${minDuration}-${maxDuration}s.`;
+    return messages.app.durationValidation({
+      targetDurationSeconds,
+      sceneCount,
+      durations,
+      minDuration,
+      maxDuration
+    });
   })();
 
   async function handleCreateProject() {
     if (state.form.scene1FirstFrameSource === "upload" && !state.form.scene1FirstFrameImage) {
       dispatch({
         type: "ui/error",
-        message: "Upload a scene 1 first frame before creating the project."
+        message: messages.app.uploadScene1FirstFrameBeforeCreate
       });
       return;
     }
@@ -156,6 +164,7 @@ export default function App() {
         provider: state.form.provider,
         scene_count: Math.max(1, Number(state.form.sceneCount)),
         workflow_mode: state.form.workflowMode,
+        subtitle_mode: state.form.subtitleMode,
         scene1_first_frame_source: state.form.scene1FirstFrameSource,
         scene1_first_frame_image:
           state.form.scene1FirstFrameSource === "upload" ? state.form.scene1FirstFrameImage : null,
@@ -168,7 +177,7 @@ export default function App() {
         type: "project/create-progress",
         project,
         stage: "global_planning",
-        message: `Project ${project.project_id} created. Building the global plan now.`
+        message: messages.app.projectCreateProgressGlobal(project.project_id)
       });
       if (project.workflow_mode === "hitl") {
         project = await optimizePrompt(project.project_id);
@@ -176,39 +185,39 @@ export default function App() {
           type: "project/create-progress",
           project,
           stage: "scene_planning",
-          message: `Global planning complete for ${project.project_id}. Building scene flow now.`
+          message: messages.app.projectCreateProgressScenes(project.project_id)
         });
         project = await planScenes(project.project_id);
       }
-      dispatch({ type: "project/create-success", project });
+      dispatch({ type: "project/create-success", project, message: messages.app.projectCreated(project.project_id) });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Project creation failed."
+        message: error instanceof Error ? error.message : messages.app.projectCreationFailed
       });
     }
   }
 
   async function handleStartWorkflow() {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before starting the workflow." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeStartingWorkflow });
       return;
     }
     dispatch({ type: "workflow/start-start" });
     try {
       const project = await startWorkflow(currentProject.project_id);
-      dispatch({ type: "workflow/start-success", project });
+      dispatch({ type: "workflow/start-success", project, message: messages.app.workflowQueued(project.project_id) });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Workflow start failed."
+        message: error instanceof Error ? error.message : messages.app.workflowStartFailed
       });
     }
   }
 
   async function handleGenerateScene(sceneId: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before generating scenes." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeGeneratingScenes });
       return;
     }
     dispatch({ type: "scene/action-start", sceneId, action: "generate" });
@@ -217,19 +226,19 @@ export default function App() {
       dispatch({
         type: "scene/action-success",
         project,
-        message: `Scene ${sceneId} queued for generation.`
+        message: messages.app.sceneQueued(sceneId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Scene generation failed."
+        message: error instanceof Error ? error.message : messages.app.sceneGenerationFailed
       });
     }
   }
 
   async function handleApproveScene(sceneId: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before approving scenes." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeApprovingScenes });
       return;
     }
     dispatch({ type: "scene/action-start", sceneId, action: "approve" });
@@ -238,12 +247,12 @@ export default function App() {
       dispatch({
         type: "scene/action-success",
         project,
-        message: `Scene ${sceneId} approved.`
+        message: messages.app.sceneApproved(sceneId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Scene approval failed."
+        message: error instanceof Error ? error.message : messages.app.sceneApprovalFailed
       });
     }
   }
@@ -255,7 +264,7 @@ export default function App() {
     storyboardNotes: string
   ) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before saving first-frame settings." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeSavingFirstFrame });
       return;
     }
     dispatch({ type: "scene/action-start", sceneId, action: "save_first_frame" });
@@ -271,19 +280,19 @@ export default function App() {
       dispatch({
         type: "scene/action-success",
         project,
-        message: `First-frame settings saved for ${sceneId}.`
+        message: messages.app.firstFrameSaved(sceneId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Saving first-frame settings failed."
+        message: error instanceof Error ? error.message : messages.app.saveFirstFrameFailed
       });
     }
   }
 
   async function handleSaveScenePrompt(sceneId: string, prompt: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before saving scene prompts." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeSavingScenePrompt });
       return;
     }
     dispatch({ type: "scene/action-start", sceneId, action: "save_prompt" });
@@ -292,19 +301,44 @@ export default function App() {
       dispatch({
         type: "scene/action-success",
         project,
-        message: `Prompt changes applied for ${sceneId}.`
+        message: messages.app.promptChangesApplied(sceneId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Saving scene prompt failed."
+        message: error instanceof Error ? error.message : messages.app.saveScenePromptFailed
+      });
+    }
+  }
+
+  async function handleReviseScenePrompt(
+    sceneId: string,
+    feedback: string,
+    scope: "prompt_only" | "opening_still_and_prompt"
+  ) {
+    if (!currentProject?.project_id) {
+      dispatch({ type: "ui/error", message: messages.app.createBeforeRevisingScenePrompt });
+      return;
+    }
+    dispatch({ type: "scene/action-start", sceneId, action: "revise_prompt" });
+    try {
+      const project = await reviseScenePrompt(currentProject.project_id, sceneId, { feedback, scope });
+      dispatch({
+        type: "scene/action-success",
+        project,
+        message: messages.app.promptFeedbackApplied(sceneId)
+      });
+    } catch (error) {
+      dispatch({
+        type: "ui/error",
+        message: error instanceof Error ? error.message : messages.app.reviseScenePromptFailed
       });
     }
   }
 
   async function handleComposeProject() {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before composing the final cut." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeCompose });
       return;
     }
     dispatch({ type: "compose/start" });
@@ -313,19 +347,47 @@ export default function App() {
       dispatch({
         type: "compose/success",
         project,
-        message: `Final video composed for ${project.project_id}.`
+        message: messages.app.finalVideoComposed(project.project_id)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Final composition failed."
+        message: error instanceof Error ? error.message : messages.app.finalCompositionFailed
+      });
+    }
+  }
+
+  async function handleExportSubtitledVideo() {
+    if (!currentProject?.project_id) {
+      dispatch({ type: "ui/error", message: messages.app.createBeforeCompose });
+      return;
+    }
+    try {
+      const project = await exportSubtitledVideo(currentProject.project_id);
+      dispatch({
+        type: "ui/notice",
+        message: messages.app.subtitledVideoExportQueued(project.project_id)
+      });
+      dispatch({
+        type: "workflow/status-update",
+        status: {
+          project_id: project.project_id,
+          project_status: project.status,
+          workflow_run_job: project.workflow_run_job ?? null,
+          project
+        }
+      });
+    } catch (error) {
+      dispatch({
+        type: "ui/error",
+        message: error instanceof Error ? error.message : messages.app.subtitledVideoExportFailed
       });
     }
   }
 
   async function handleGenerateCharacterReference(characterId: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before generating character references." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeGeneratingCharacterReferences });
       return;
     }
     dispatch({ type: "character/action-start", characterId, action: "generate_reference" });
@@ -334,19 +396,19 @@ export default function App() {
       dispatch({
         type: "character/action-success",
         project,
-        message: `Character reference generated for ${characterId}.`
+        message: messages.app.characterReferenceGenerated(characterId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Character reference generation failed."
+        message: error instanceof Error ? error.message : messages.app.characterReferenceGenerationFailed
       });
     }
   }
 
   async function handleUploadCharacterReference(characterId: string, referenceImage: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before uploading character references." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeUploadingCharacterReferences });
       return;
     }
     dispatch({ type: "character/action-start", characterId, action: "upload_reference" });
@@ -355,19 +417,19 @@ export default function App() {
       dispatch({
         type: "character/action-success",
         project,
-        message: `Character reference uploaded for ${characterId}.`
+        message: messages.app.characterReferenceUploaded(characterId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Character reference upload failed."
+        message: error instanceof Error ? error.message : messages.app.characterReferenceUploadFailed
       });
     }
   }
 
   async function handleApproveCharacterReference(characterId: string) {
     if (!currentProject?.project_id) {
-      dispatch({ type: "ui/error", message: "Create a project before approving character references." });
+      dispatch({ type: "ui/error", message: messages.app.createBeforeApprovingCharacterReferences });
       return;
     }
     dispatch({ type: "character/action-start", characterId, action: "approve_reference" });
@@ -376,12 +438,12 @@ export default function App() {
       dispatch({
         type: "character/action-success",
         project,
-        message: `Character reference approved for ${characterId}.`
+        message: messages.app.characterReferenceApproved(characterId)
       });
     } catch (error) {
       dispatch({
         type: "ui/error",
-        message: error instanceof Error ? error.message : "Character reference approval failed."
+        message: error instanceof Error ? error.message : messages.app.characterReferenceApprovalFailed
       });
     }
   }
@@ -431,34 +493,49 @@ export default function App() {
     <main className="app-shell">
       <section className="hero">
         <div className="hero-copy">
-          <p className="eyebrow">Video Workflow Service</p>
-          <h1>Short video workflow studio.</h1>
-          <p>
-            Build a project brief, establish the opening frame, generate scenes, review each result, and compose the
-            final cut in one workspace.
-          </p>
+          <div className="hero-copy-top">
+            <p className="eyebrow">{messages.hero.eyebrow}</p>
+            <div className="locale-switcher" role="group" aria-label={messages.locale.label}>
+              <button
+                type="button"
+                className={`locale-button${locale === "zh-CN" ? " locale-button-active" : ""}`}
+                onClick={() => setLocale("zh-CN")}
+              >
+                {messages.locale.chinese}
+              </button>
+              <button
+                type="button"
+                className={`locale-button${locale === "en" ? " locale-button-active" : ""}`}
+                onClick={() => setLocale("en")}
+              >
+                {messages.locale.english}
+              </button>
+            </div>
+          </div>
+          <h1>{messages.hero.title}</h1>
+          <p>{messages.hero.description}</p>
         </div>
         <aside className="hero-visual" aria-hidden="true">
           <div className="hero-diagram">
             <article className="hero-node hero-node-primary">
               <span className="hero-node-index">01</span>
-              <strong>Opening Frame</strong>
-              <p>Upload a still or let the system generate one for scene 1.</p>
+              <strong>{messages.hero.step1Title}</strong>
+              <p>{messages.hero.step1Description}</p>
             </article>
             <article className="hero-node">
               <span className="hero-node-index">02</span>
-              <strong>Story &amp; Scenes</strong>
-              <p>Optimize prompt, plan scenes, assign dialogue, and compile scene prompts.</p>
+              <strong>{messages.hero.step2Title}</strong>
+              <p>{messages.hero.step2Description}</p>
             </article>
             <article className="hero-node">
               <span className="hero-node-index">03</span>
-              <strong>Scene Review</strong>
-              <p>Generate each scene, inspect the result, revise inputs when needed, and approve.</p>
+              <strong>{messages.hero.step3Title}</strong>
+              <p>{messages.hero.step3Description}</p>
             </article>
             <article className="hero-node hero-node-accent">
               <span className="hero-node-index">04</span>
-              <strong>Final Compose</strong>
-              <p>Assemble approved scenes into the delivered MP4 once the review flow is complete.</p>
+              <strong>{messages.hero.step4Title}</strong>
+              <p>{messages.hero.step4Description}</p>
             </article>
           </div>
         </aside>
@@ -512,9 +589,10 @@ export default function App() {
           onApprove={handleApproveScene}
           onCompose={handleComposeProject}
           onSavePrompt={handleSaveScenePrompt}
+          onRevisePrompt={handleReviseScenePrompt}
           onSaveFirstFrame={handleSaveFirstFrame}
         />
-      <FinalVideoPanel project={currentProject} />
+      <FinalVideoPanel project={currentProject} onExportSubtitledVideo={handleExportSubtitledVideo} />
     </main>
   );
 }

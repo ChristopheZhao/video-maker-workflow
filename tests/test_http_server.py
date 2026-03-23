@@ -94,6 +94,35 @@ class HttpServerTestCase(unittest.TestCase):
             self.assertEqual(payload["scene1_first_frame_source"], "upload")
             self.assertEqual(payload["scene1_first_frame_image"], "data:image/png;base64,c2NlbmUx")
 
+    def test_create_project_route_accepts_subtitle_mode(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            service = WorkflowService(settings)
+            handler = self._build_handler(
+                service,
+                settings,
+                "/projects",
+                method="POST",
+                body={
+                    "title": "HTTP Subtitle Mode",
+                    "prompt": "A voiced trailer.",
+                    "provider": "mock",
+                    "workflow_mode": "hitl",
+                    "subtitle_mode": "enabled",
+                },
+            )
+
+            handler.do_POST()
+            payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+            self.assertEqual(handler.status_code, 201)
+            self.assertEqual(payload["subtitle_mode"], "enabled")
+            self.assertEqual(payload["subtitle"]["status"], "not_applicable")
+
     def test_json_response_ignores_broken_pipe(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             settings = load_settings(tmp_dir)
@@ -175,6 +204,147 @@ class HttpServerTestCase(unittest.TestCase):
 
             self.assertEqual(handler.status_code, 200)
             self.assertEqual(payload["scenes"][0]["prompt"], "A refined prompt from the browser.")
+
+    def test_scene_prompt_revise_route_updates_prompt(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="HTTP Prompt Revise Project",
+                prompt="A lion waits behind zoo bars and dreams of the grassland.",
+                provider="mock",
+                workflow_mode="hitl",
+            )
+            service.optimize_prompt(project.project_id)
+            service.plan_scenes(project.project_id)
+
+            handler = self._build_handler(
+                service,
+                settings,
+                f"/projects/{project.project_id}/scenes/scene-01/revise",
+                method="POST",
+                body={"feedback": "门不应该开着", "scope": "opening_still_and_prompt"},
+            )
+            handler.do_POST()
+            payload = json.loads(handler.wfile.getvalue().decode("utf-8"))
+
+            self.assertEqual(handler.status_code, 200)
+            self.assertIn("门不应该开着", payload["scenes"][0]["prompt"])
+
+    def test_artifact_download_query_sets_attachment_header(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            artifact = settings.artifact_dir / "delivery" / "final.mp4"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_bytes(b"fake-mp4")
+            service = WorkflowService(settings)
+
+            inline_handler = self._build_handler(service, settings, "/artifacts/delivery/final.mp4")
+            inline_handler.do_GET()
+            self.assertEqual(inline_handler.status_code, 200)
+            self.assertNotIn("Content-Disposition", inline_handler.sent_headers)
+
+            download_handler = self._build_handler(service, settings, "/artifacts/delivery/final.mp4?download=1")
+            download_handler.do_GET()
+            self.assertEqual(download_handler.status_code, 200)
+            self.assertEqual(
+                download_handler.sent_headers.get("Content-Disposition"),
+                'attachment; filename="final.mp4"',
+            )
+
+    def test_artifact_route_serves_vtt_with_text_vtt_content_type(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            artifact = settings.artifact_dir / "delivery" / "final.vtt"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+            service = WorkflowService(settings)
+
+            handler = self._build_handler(service, settings, "/artifacts/delivery/final.vtt")
+            handler.do_GET()
+
+            self.assertEqual(handler.status_code, 200)
+            self.assertEqual(handler.sent_headers.get("Content-Type"), "text/vtt")
+
+    def test_delivery_package_route_serves_zip_attachment(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="HTTP Delivery Package",
+                prompt="A voiced trailer.",
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            delivery_dir = settings.artifact_dir / project.project_id / "delivery"
+            delivery_dir.mkdir(parents=True, exist_ok=True)
+            final_video_path = delivery_dir / "final.mp4"
+            srt_path = delivery_dir / "final.srt"
+            vtt_path = delivery_dir / "final.vtt"
+            final_video_path.write_bytes(b"fake-mp4")
+            srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
+            vtt_path.write_text("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello\n", encoding="utf-8")
+            project.final_video_rel_path = f"{project.project_id}/delivery/final.mp4"
+            project.subtitle_srt_rel_path = f"{project.project_id}/delivery/final.srt"
+            project.subtitle_vtt_rel_path = f"{project.project_id}/delivery/final.vtt"
+            service.repo.save(project)
+
+            handler = self._build_handler(
+                service,
+                settings,
+                f"/projects/{project.project_id}/delivery-package",
+            )
+            handler.do_GET()
+
+            self.assertEqual(handler.status_code, 200)
+            self.assertEqual(handler.sent_headers.get("Content-Disposition"), 'attachment; filename="final_delivery.zip"')
+            self.assertEqual(handler.sent_headers.get("Content-Type"), "application/zip")
+
+    def test_export_subtitled_video_route_returns_accepted(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            settings = load_settings(tmp_dir)
+            self._write_frontend_build(
+                settings.frontend_dist_dir,
+                {"index.html": "<!doctype html><html><body>ok</body></html>"},
+            )
+            service = WorkflowService(settings)
+            project = service.create_project(
+                title="HTTP Subtitle Burn Export",
+                prompt="A voiced trailer.",
+                provider="mock",
+                subtitle_mode="enabled",
+            )
+            project.final_video_rel_path = f"{project.project_id}/delivery/final.mp4"
+            project.subtitle_srt_rel_path = f"{project.project_id}/delivery/final.srt"
+            service.repo.save(project)
+
+            handler = self._build_handler(
+                service,
+                settings,
+                f"/projects/{project.project_id}/export-subtitled-video",
+                method="POST",
+                body={},
+            )
+            with unittest.mock.patch.object(service, "export_subtitled_video", return_value=service.get_project(project.project_id)):
+                handler.do_POST()
+
+            self.assertEqual(handler.status_code, 202)
 
     def test_character_lookdev_routes_generate_upload_and_approve(self) -> None:
         with TemporaryDirectory() as tmp_dir:

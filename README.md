@@ -57,11 +57,24 @@ To run the real workflow end to end, make sure these dependencies are available:
 
 - Python environment managed by `uv`
 - Node.js and `npm` for the frontend workspace
-- `ffmpeg` available on `PATH`
+- `ffmpeg` and `ffprobe` available on `PATH`
+- `ffmpeg` built with subtitle burning support (`subtitles` / `libass` filter available)
 - A Doubao / Ark account with access to:
   - the video model you want to use
   - `doubao-seed-2-0-lite-260215` for LLM planning nodes
   - `doubao-seedream-5-0-lite-260128` for auto-generated opening stills
+
+If you want delivery-side subtitles, also prepare a Volcengine Speech application with:
+
+- `VOLCENGINE_SPEECH_APP_ID`
+- `VOLCENGINE_SPEECH_ACCESS_TOKEN`
+- access to `automatic subtitle alignment`
+- access to `volc.bigasr.auc_turbo` for ASR fallback
+
+Notes:
+
+- Subtitle generation is optional. If the speech credentials are not configured, the video workflow still runs normally and subtitle delivery is skipped.
+- Burned-subtitle export does **not** require you to install a Chinese font on the host machine. The repository bundles a CJK font and uses it explicitly during subtitle burn-in.
 
 ## Runtime Configuration
 
@@ -122,12 +135,27 @@ VIDEO_WORKFLOW_MAX_WORKERS=2
 VIDEO_WORKFLOW_PORT=8787
 ```
 
+If you want subtitle delivery, add these values:
+
+```bash
+VIDEO_WORKFLOW_SUBTITLE_SERVICE=volcengine_speech
+VOLCENGINE_SPEECH_APP_ID=
+VOLCENGINE_SPEECH_ACCESS_TOKEN=
+VOLCENGINE_SPEECH_BASE_URL=https://openspeech.bytedance.com
+VOLCENGINE_SPEECH_ATA_SUBMIT_PATH=/api/v1/vc/ata/submit
+VOLCENGINE_SPEECH_ATA_QUERY_PATH=/api/v1/vc/ata/query
+VOLCENGINE_SPEECH_ASR_SUBMIT_PATH=/api/v3/auc/bigmodel/recognize/flash
+VOLCENGINE_SPEECH_ASR_RESOURCE_ID=volc.bigasr.auc_turbo
+VOLCENGINE_SPEECH_ASR_MODEL_NAME=bigmodel
+```
+
 Notes:
 
 - Shell environment variables take priority over `.env`.
 - `.env.local` overrides `.env`.
 - If `VIDEO_WORKFLOW_LLM_PROVIDER` is not explicitly set to `doubao`, the planning nodes may fall back to the internal `mock` LLM in local/offline scenarios.
 - After changing `.env`, restart the backend service.
+- `VIDEO_WORKFLOW_PUBLIC_BASE_URL` is no longer required for subtitle fallback.
 
 ## Quick Start
 
